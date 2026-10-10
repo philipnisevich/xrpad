@@ -1,0 +1,4 @@
+# Local Wi-Fi credentials; copy secrets.example.h to secrets.h
+secrets.h
+build/
+.DS_Store
