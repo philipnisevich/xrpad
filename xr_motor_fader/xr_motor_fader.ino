@@ -38,8 +38,12 @@ const uint8_t  MOTOR_IN1    = 12;
 const uint8_t  MOTOR_IN2    = 11;
 const bool     MOTOR_REVERSE = false; // flip if the motor drives away from the target
 
-const uint32_t POT_MIN_MV   = 40;     // reading at the bottom of travel
-const uint32_t POT_MAX_MV   = 3100;   // reading at the top (ADC tops out around 3.1 V)
+const uint32_t POT_MIN_MV   = 40;     // bottom/top readings if boot calibration fails
+const uint32_t POT_MAX_MV   = 3100;   // (ADC tops out around 3.1 V)
+const float    POT_END_GAP  = 0.015f; // buffer at each end: -inf and +10 dB sit this
+                                      // fraction of travel in from the end stops
+const uint32_t CAL_DRIVE_MS = 500;    // full power into each end stop at boot
+const uint32_t CAL_MIN_SPAN_MV = 1500; // less than this = calibration failed
 const float    POT_DEADBAND = 5.0f / 1023.0f;  // ignore wobble smaller than this
 const float    PICKUP_RANGE = 0.015f; // fader this close to the level = picked up
 const uint32_t POT_READ_MS  = 5;
@@ -55,6 +59,9 @@ const float    MOTOR_MIN_DUTY = 0.55f; // least power that still moves the fader
 const float    MOTOR_KP     = 5.0f;   // full power until within 20% of travel
 const float    MOTOR_TOL    = 0.008f; // close enough to stop
 const uint32_t MOTOR_BRAKE_MS = 30;   // short brake on arrival to stop coasting
+const uint32_t MOTOR_STALL_MS = 30;   // no movement for this long = add power...
+const uint32_t MOTOR_KICK_MS = 150;   // ...ramping to full power over this long
+const uint32_t MOTOR_END_MS = 80;     // -inf/+10 dB: stopped this long at the end stop = there
 const uint32_t MOTOR_TIMEOUT_MS = 1500;
 
 const uint16_t XR_PORT      = 10024;
@@ -125,6 +132,7 @@ float touchBaseline = 0.0f;
 // fader position for the main loop.
 
 volatile float potSmooth = -1.0f;   // fader position 0.0 - 1.0, filtered
+float potMinMv = POT_MIN_MV, potMaxMv = POT_MAX_MV;  // set by calibrateFader()
 volatile float motorTarget = 0.0f;
 volatile uint32_t motorSeq = 0;     // bumped for each new move request
 volatile bool motorArrived = false;
@@ -142,15 +150,15 @@ void motorBrake() {  // both inputs high shorts the motor
 }
 
 void motorTask(void *) {
-  float smooth = -1.0f, startErr = 0.0f;
+  float smooth = -1.0f, startErr = 0.0f, progressPos = 0.0f;
   bool moving = false;
-  uint32_t seenSeq = 0, startAt = 0, brakeUntil = 0;
+  uint32_t seenSeq = 0, startAt = 0, brakeUntil = 0, progressAt = 0;
 
   for (;;) {
     uint32_t mv = 0;
     for (int i = 0; i < 4; i++) mv += analogReadMilliVolts(POT_PIN);
     mv /= 4;
-    float raw = constrain(((float)mv - POT_MIN_MV) / (POT_MAX_MV - POT_MIN_MV), 0.0f, 1.0f);
+    float raw = constrain(((float)mv - potMinMv) / (potMaxMv - potMinMv), 0.0f, 1.0f);
     if (POT_REVERSE) raw = 1.0f - raw;
     smooth = smooth < 0.0f ? raw : smooth + 0.3f * (raw - smooth);
     potSmooth = smooth;
@@ -166,15 +174,31 @@ void motorTask(void *) {
       moving = !touched;
       startAt = now;
       startErr = fabsf(motorTarget - smooth);
+      progressPos = smooth;
+      progressAt = now;
     }
 
     if (moving) {
       float err = motorTarget - smooth;
+      // -inf and +10 dB aren't aimed at: the motor drives into the end stop
+      // at full power until the fader stops, so it always gets all the way.
+      bool endTarget = motorTarget <= 0.0f || motorTarget >= 1.0f;
+      if (fabsf(smooth - progressPos) > 0.004f) {
+        progressPos = smooth;
+        progressAt = now;
+      }
+      uint32_t stuck = now - progressAt;
+
       if (touched) {
         motorDrive(0.0f);
         moving = false;
         Serial.printf("[%lu] motor: hand on fader, letting go\n", now);
-      } else if (fabsf(err) <= MOTOR_TOL) {
+      } else if (endTarget && stuck > MOTOR_END_MS) {
+        motorDrive(0.0f);
+        moving = false;
+        motorArrived = true;
+        Serial.printf("[%lu] motor: at end stop in %lu ms (%.3f)\n", now, now - startAt, smooth);
+      } else if (!endTarget && fabsf(err) <= MOTOR_TOL) {
         motorBrake();
         brakeUntil = now + MOTOR_BRAKE_MS;
         moving = false;
@@ -189,7 +213,11 @@ void motorTask(void *) {
         moving = false;
         Serial.printf("[%lu] motor: gave up, %.3f from target\n", now, err);
       } else {
+        // Low power near the target can't always beat static friction, so
+        // if the fader stops moving, ramp the power up until it does.
+        float kick = stuck > MOTOR_STALL_MS ? (float)(stuck - MOTOR_STALL_MS) / MOTOR_KICK_MS : 0.0f;
         float power = constrain(fabsf(err) * MOTOR_KP, MOTOR_MIN_DUTY, 1.0f);
+        power = endTarget ? 1.0f : min(power + kick, 1.0f);
         motorDrive(err > 0.0f ? power : -power);
       }
     }
@@ -197,10 +225,38 @@ void motorTask(void *) {
   }
 }
 
+uint32_t readEndStop(float speed) {
+  motorDrive(speed);
+  delay(CAL_DRIVE_MS);
+  uint32_t mv = 0;
+  for (int i = 0; i < 32; i++) mv += analogReadMilliVolts(POT_PIN);
+  motorDrive(0.0f);
+  delay(50);
+  return mv / 32;
+}
+
+// Drive into both end stops and measure them, so -inf and +10 dB map to
+// points the motor can always reach, a small gap in from each end.
+void calibrateFader() {
+  uint32_t a = readEndStop(-1.0f), b = readEndStop(1.0f);
+  uint32_t bottom = min(a, b), top = max(a, b);  // either way round if POT_REVERSE
+  if (top < bottom + CAL_MIN_SPAN_MV) {
+    Serial.printf("Fader calibration failed (bottom %lu mV, top %lu mV), using defaults\n",
+                  bottom, top);
+    return;
+  }
+  float gap = (top - bottom) * POT_END_GAP;
+  potMinMv = bottom + gap;
+  potMaxMv = top - gap;
+  Serial.printf("Fader calibrated: ends %lu-%lu mV, using %.0f-%.0f mV\n",
+                bottom, top, potMinMv, potMaxMv);
+}
+
 void motorBegin() {
   ledcAttach(MOTOR_IN1, MOTOR_PWM_HZ, MOTOR_PWM_BITS);
   ledcAttach(MOTOR_IN2, MOTOR_PWM_HZ, MOTOR_PWM_BITS);
   motorDrive(0.0f);
+  calibrateFader();
   xTaskCreatePinnedToCore(motorTask, "motor", 4096, nullptr, 3, nullptr, 1);
 }
 
@@ -274,6 +330,7 @@ void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
       lastXremote = 0;  // subscribe and start a query sweep right away
       dirty = true;
       Serial.printf("Found mixer at %s\n", from.toString().c_str());
+      Serial.printf("Fader range %.0f-%.0f mV\n", potMinMv, potMaxMv);
     }
     return;
   }
@@ -350,6 +407,11 @@ void selectStrip(int i) {
   if (!touched) requestMove();
   dirty = true;
   Serial.printf("[%lu] select %s \"%s\"\n", millis(), s.label, s.name);
+  static bool reportedRange = false;
+  if (!reportedRange) {
+    reportedRange = true;
+    Serial.printf("Fader range %.0f-%.0f mV\n", potMinMv, potMaxMv);
+  }
 }
 
 // ---------- slide fader ----------
@@ -538,10 +600,11 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ENC_DT), onEncoder, CHANGE);
   analogReadResolution(12);
   calibrateTouch();
-  motorBegin();
 
   oled.setBusClock(400000);
   oled.begin();
+  drawStatus("Calibrating", "fader...");
+  motorBegin();
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);  // lower latency
