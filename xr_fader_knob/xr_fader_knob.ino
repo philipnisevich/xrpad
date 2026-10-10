@@ -27,10 +27,8 @@ const uint32_t QUERY_GAP_MS = 15;     // spacing between state queries
 const uint32_t SEND_GAP_MS  = 25;     // max fader update rate while turning
 const uint32_t LOCK_MS      = 600;    // ignore mixer echoes this long after a turn
 const uint32_t FAST_TURN_MS = 50;     // clicks closer than this = 0.5 dB steps
-const uint32_t SPIN_TURN_MS = 15;     // clicks closer than this = 10 dB steps
 const float    STEP_DB      = 0.1f;
 const float    FAST_STEP_DB = 0.5f;
-const float    SPIN_STEP_DB = 10.0f;
 const uint32_t DEBOUNCE_MS  = 30;
 const uint32_t FRAME_MS     = 33;
 
@@ -390,7 +388,7 @@ void loop() {
   uint32_t gap;
   int clicks = takeClicks(gap);
   if (clicks && haveMixer) {
-    float step = gap < SPIN_TURN_MS ? SPIN_STEP_DB : gap < FAST_TURN_MS ? FAST_STEP_DB : STEP_DB;
+    float step = gap < FAST_TURN_MS ? FAST_STEP_DB : STEP_DB;
     turnSelected(clicks, step);
     char text[16];
     formatDb(text, sizeof(text), strips[selected].fader);
