@@ -53,6 +53,9 @@ const bool     ENC_REVERSE  = false;  // flip if clockwise goes to the previous 
 const bool     POT_REVERSE  = false;  // flip if pushing the fader up lowers the level
 const uint8_t  MOTOR_IN1    = 12;
 const uint8_t  MOTOR_IN2    = 11;
+const uint8_t  FB_TX        = 13;     // link to the 8-fader board (its RX, G44)
+const uint8_t  FB_RX        = 14;     // (its TX, G43)
+const uint32_t FB_BAUD      = 921600;
 const bool     MOTOR_REVERSE = false; // flip if the motor drives away from the target
 
 const uint32_t POT_MIN_MV   = 40;     // bottom/top readings if boot calibration fails
@@ -106,6 +109,7 @@ struct Strip {
   bool sendDue;      // local change not yet sent
   bool needsFinal;   // resend + confirm once the fader stops
   uint32_t lockedUntil;
+  uint32_t lastSendAt;
 };
 
 const int NUM_STRIPS = 18;
@@ -265,7 +269,7 @@ SemaphoreHandle_t stateLock;
 
 // Touch actions from the TFT, handled by the main loop (which owns the network).
 enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO, UI_SCAN, UI_EDIT, UI_TOGGLE,
-                              UI_MUTE_ANY, UI_MUTEGRP, UI_SET };
+                              UI_MUTE_ANY, UI_MUTEGRP, UI_SET, UI_BANK };
 struct UiAction { UiActionType type; int8_t arg; uint8_t arg2; };
 QueueHandle_t uiQueue;
 void handleUiAction(const UiAction &a);
@@ -279,7 +283,7 @@ void editParam(int clicks, bool fast);
 WiFiUDP udp;
 IPAddress mixerIp;
 volatile bool haveMixer = false;
-uint32_t lastRx = 0, lastXremote = 0, lastProbe = 0, lastQuery = 0, lastSend = 0;
+uint32_t lastRx = 0, lastXremote = 0, lastProbe = 0, lastQuery = 0;
 int sweepPos = -1;   // position in the all-strips query sweep, -1 = idle
 int extraPos = -1;   // position in the mixer-wide (home screen) queries
 uint32_t lastExtra = 0;
@@ -1379,6 +1383,10 @@ void handleUiAction(const UiAction &a) {
     editIdx = a.arg2;
     return;
   }
+  if (a.type == UI_BANK) {
+    setBank(a.arg2);
+    return;
+  }
   if (a.type == UI_SET) {  // set a parameter of the selected strip to a value (arg2)
     if (haveMixer && a.arg == P_INS_SLOT && selected < 16) {
       setParam(selected, P_INS_SLOT, 0, a.arg2);
@@ -1605,6 +1613,157 @@ void updateDisplay() {
   else                drawMixer();
 }
 
+// ---------- 8-fader board ----------
+
+// A second ESP32 (xr_fader_board) runs 8 motorized faders. The home screen's
+// bank tabs choose what they control; this loop sends each fader the level
+// of what it's assigned to, and turns a hand moving one into a level change.
+
+const int BANK_FADERS = 8;
+enum BankId : uint8_t { BANK_1_8, BANK_9_16, BANK_RTN, BANK_BUS, BANK_DCA, NUM_BANKS };
+const uint32_t FB_TIMEOUT_MS = 1000;      // no status lines for this long = board gone
+const uint32_t FB_RESEND_MS = 2000;       // re-send every target this often (lost lines)
+const float    FB_DEADBAND = 4.0f / 1000; // ignore position wobble smaller than this
+const uint32_t FB_OTHER_GAP_MS = 25;      // max send rate for bus/FX/DCA levels
+
+struct BankItem { int8_t kind, idx; };    // kind: 0 nothing, 1 strip, 2 others[]
+BankItem bankItem(int b, int i);
+float bankValue(const BankItem &it);
+void applyBankFader(int i, const BankItem &it, float pos, uint32_t now);
+
+volatile uint8_t bank = BANK_1_8;
+bool fbConnected = false, fbHasTouch = false;
+int fbFaders = 0;
+uint32_t fbLastLine = 0, fbLastResend = 0;
+float fbPos[BANK_FADERS];        // where each fader is, 0-1 (-1 unknown)
+uint16_t fbTouch = 0, fbWasTouched = 0;
+float fbSent[BANK_FADERS];       // last target sent (-2 = force a send)
+float fbApplied[BANK_FADERS];    // last position turned into a level
+uint32_t fbOtherSentAt[BANK_FADERS];
+
+BankItem bankItem(int b, int i) {
+  switch (b) {
+    case BANK_1_8:  return {1, (int8_t)i};
+    case BANK_9_16: return {1, (int8_t)(8 + i)};
+    case BANK_RTN: {  // AUX, FX returns 1-4, MAIN
+      static const BankItem RTN[] = {{1, AUX_STRIP}, {2, OTHER_RTN}, {2, OTHER_RTN + 1}, {2, OTHER_RTN + 2},
+                                     {2, OTHER_RTN + 3}, {1, MAIN_STRIP}, {0, 0}, {0, 0}};
+      return RTN[i];
+    }
+    case BANK_BUS:  // buses 1-6, FX sends 1-2
+      return i < 6 ? BankItem{2, (int8_t)(OTHER_BUS + i)} : BankItem{2, (int8_t)(OTHER_FXSEND + i - 6)};
+    case BANK_DCA:  // DCAs 1-4, FX sends 1-4
+      return i < 4 ? BankItem{2, (int8_t)(OTHER_DCA + i)} : BankItem{2, (int8_t)(OTHER_FXSEND + i - 4)};
+  }
+  return {0, 0};
+}
+
+float bankValue(const BankItem &it) {
+  if (it.kind == 1) return strips[it.idx].haveFader ? strips[it.idx].fader : NAN;
+  if (it.kind == 2) return others[it.idx].fader;
+  return NAN;
+}
+
+void setBank(int b) {
+  if (b < 0 || b >= NUM_BANKS || b == bank) return;
+  bank = b;
+  for (float &x : fbSent) x = -2;  // every fader flies to its new level
+  Serial.printf("[%lu] fader bank %d\n", millis(), b);
+}
+
+void faderBoardBegin() {
+  Serial1.begin(FB_BAUD, SERIAL_8N1, FB_RX, FB_TX);
+  for (int i = 0; i < BANK_FADERS; i++) { fbPos[i] = -1; fbSent[i] = -2; fbApplied[i] = -1; }
+  Serial1.println("?");
+}
+
+void readFaderBoard(uint32_t now) {
+  static char buf[96];
+  static int len = 0;
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (c != '\n' && c != '\r') {
+      if (len < (int)sizeof(buf) - 1) buf[len++] = c;
+      continue;
+    }
+    if (!len) continue;
+    buf[len] = 0;
+    len = 0;
+    if (buf[0] == 'S') {
+      int v[BANK_FADERS], mask;
+      if (sscanf(buf + 1, "%d %d %d %d %d %d %d %d %d", &mask, &v[0], &v[1], &v[2], &v[3], &v[4],
+                 &v[5], &v[6], &v[7]) == 9) {
+        fbTouch = mask;
+        for (int i = 0; i < BANK_FADERS; i++) fbPos[i] = v[i] < 0 ? -1.0f : v[i] / 1000.0f;
+        if (!fbConnected) {
+          fbConnected = true;
+          for (float &x : fbSent) x = -2;
+          Serial1.println("?");
+        }
+        fbLastLine = now;
+      }
+    } else if (buf[0] == 'H') {
+      int n = 0, t = 0;
+      sscanf(buf + 1, "%d %d", &n, &t);
+      fbFaders = n;
+      fbHasTouch = t;
+      Serial.printf("Fader board: %d faders, touch sensor %s\n", n, t ? "yes" : "no");
+    }
+  }
+  if (fbConnected && now - fbLastLine > FB_TIMEOUT_MS) {
+    fbConnected = false;
+    fbTouch = 0;
+    Serial.println("Fader board disconnected");
+  }
+}
+
+// A hand moved bank fader i: set what it's assigned to.
+void applyBankFader(int i, const BankItem &it, float pos, uint32_t now) {
+  pos = roundf(pos * 1023.0f) / 1023.0f;
+  if (it.kind == 1) {
+    Strip &s = strips[it.idx];
+    s.fader = pos;
+    s.sendDue = s.needsFinal = true;
+    s.lockedUntil = now + LOCK_MS;
+    if (it.idx == selected && !touched) requestMove();  // the console's own fader follows
+    dirty = true;
+  } else if (it.kind == 2 && now - fbOtherSentAt[i] >= FB_OTHER_GAP_MS) {
+    fbOtherSentAt[i] = now;
+    setParam(selected, P_OTHER, it.idx, pos);
+  } else {
+    return;  // rate-limited: try again next loop
+  }
+  fbApplied[i] = pos;
+  fbSent[i] = pos;  // it's already there; no need to send it back
+}
+
+void bankService(uint32_t now) {
+  if (!fbConnected) return;
+  bool resend = now - fbLastResend > FB_RESEND_MS;
+  if (resend) fbLastResend = now;
+  for (int i = 0; i < BANK_FADERS && i < max(fbFaders, 1); i++) {
+    BankItem it = bankItem(bank, i);
+    bool hand = fbTouch & (1 << i);
+    bool wasHand = fbWasTouched & (1 << i);
+
+    if (hand && it.kind) {
+      if (!wasHand && it.kind == 1 && it.idx != selected) selectStrip(it.idx);  // show it on the TFT
+      float pos = fbPos[i];
+      if (pos >= 0 && (fabsf(pos - fbApplied[i]) > FB_DEADBAND || !wasHand)) applyBankFader(i, it, pos, now);
+      continue;
+    }
+    // Not touched: keep the fader on its level (unassigned faders park at the bottom)
+    float v = it.kind ? bankValue(it) : 0.0f;
+    if (isnan(v)) continue;
+    if (wasHand || resend || fabsf(v - fbSent[i]) > 0.002f) {
+      Serial1.printf("T %d %d\n", i, (int)lroundf(v * 1000.0f));
+      fbSent[i] = v;
+      fbApplied[i] = v;
+    }
+  }
+  fbWasTouched = fbTouch;
+}
+
 // ---------- TFT ----------
 
 #include "ui.h"
@@ -1630,6 +1789,7 @@ void setup() {
   calibrateTouch();
 
   uiBegin();  // TFT splash, touchscreen calibration, then the UI task
+  faderBoardBegin();
 
   oled.setBusClock(400000);
   oled.begin();
@@ -1731,10 +1891,13 @@ void loop() {
     else readPot();
   }
 
+  readFaderBoard(now);
+  if (online && haveMixer) bankService(now);
+
   for (Strip &s : strips) {
     if (!online) break;
-    if (s.sendDue && now - lastSend >= SEND_GAP_MS) {
-      lastSend = now;
+    if (s.sendDue && now - s.lastSendAt >= SEND_GAP_MS) {
+      s.lastSendAt = now;
       s.sendDue = false;
       sendStripOsc(s, "/mix/fader", true);
     }

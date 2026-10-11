@@ -206,6 +206,12 @@ struct Snap {
   Other oth[NUM_OTHERS];
   MixerInfo mi;
   float meters40[40];
+
+  // 8-fader board
+  uint8_t bank;
+  bool fbConnected, fbHasTouch;
+  int fbFaders;
+  uint16_t fbTouch;
 };
 
 Snap snap;
@@ -265,6 +271,11 @@ void takeSnapshot() {
   memcpy(snap.oth, others, sizeof(others));
   snap.mi = mixInfo;
   memcpy(snap.meters40, allMeters, sizeof(allMeters));
+  snap.bank = bank;
+  snap.fbConnected = fbConnected;
+  snap.fbHasTouch = fbHasTouch;
+  snap.fbFaders = fbFaders;
+  snap.fbTouch = fbTouch;
   xSemaphoreGive(stateLock);
 }
 
@@ -1344,8 +1355,20 @@ float meterPair(int a, int b) {
 
 // A vertical strip: name, (channel) source and badges, meter + fader, dB,
 // pan (channels), and a mute button.
+// Which bank fader (0-7) a home strip is on right now, or -1.
+int faderFor(const HomeStrip &h) {
+  if (!snap.fbConnected) return -1;
+  for (int i = 0; i < BANK_FADERS && i < max(snap.fbFaders, 1); i++) {
+    BankItem it = bankItem(snap.bank, i);
+    if ((it.kind == 1 && it.idx == h.ch && h.ch >= 0) || (it.kind == 2 && it.idx == h.oi && h.oi >= 0)) return i;
+  }
+  return -1;
+}
+
 void homeStrip(LGFX_Sprite &s, int x, int w, const HomeStrip &h) {
   const int top = 4, bottom = 272;
+  int fader = faderFor(h);
+  bool hand = fader >= 0 && (snap.fbTouch & (1 << fader));
   bool sel = h.ch >= 0 && h.ch == snap.sel;
   bool edit = h.oi >= 0 && editing(P_OTHER, h.oi);
   uint16_t cc = chanColor(h.color);
@@ -1353,6 +1376,15 @@ void homeStrip(LGFX_Sprite &s, int x, int w, const HomeStrip &h) {
   if (sel) { s.drawRoundRect(x, top, w, bottom - top, 6, cc); s.drawRoundRect(x + 1, top + 1, w - 2, bottom - top - 2, 5, cc); }
   if (edit) selectedOutline(s, x, top, w, bottom - top, 6);
   s.fillRect(x + 4, top + 4, w - 8, 3, cc);
+  if (fader >= 0) {  // on a motorized fader: its number, lit while a hand is on it
+    char t[3];
+    snprintf(t, sizeof(t), "%d", fader + 1);
+    s.fillSmoothCircle(x + 9, top + 14, 6, hand ? C_TEXT : C_TEAL);
+    s.setFont(&fonts::DejaVu9);
+    s.setTextDatum(middle_center);
+    s.setTextColor(C_BG);
+    s.drawString(t, x + 9, top + 15);
+  }
 
   s.setFont(&fonts::DejaVu9);
   s.setTextDatum(top_center);
@@ -1417,7 +1449,8 @@ void homeStrip(LGFX_Sprite &s, int x, int w, const HomeStrip &h) {
   if (!isnan(h.fader)) {
     int fy = fBot - (int)lroundf(h.fader * fh);
     int capW = min(w - 22, 26);
-    s.fillSmoothRoundRect(fx - capW / 2, fy - 6, capW, 12, 3, edit ? C_TEXT : rgb(176, 188, 202));
+    s.fillSmoothRoundRect(fx - capW / 2, fy - 6, capW, 12, 3, edit || hand ? C_TEXT : rgb(176, 188, 202));
+    if (hand) s.drawRoundRect(fx - capW / 2 - 1, fy - 7, capW + 2, 14, 4, C_TEAL);
     s.fillRect(fx - capW / 2 + 3, fy - 1, capW - 6, 2, cc);
   }
   char t[10];
@@ -1450,6 +1483,18 @@ void homeStrip(LGFX_Sprite &s, int x, int w, const HomeStrip &h) {
   else zone(x, top, w, my - top - 4, Z_EDIT, P_OTHER, h.oi);
 }
 
+// The fader bank a home tab puts on the motorized faders, or -1.
+int tabBank(int tab) {
+  switch (tab) {
+    case T_BANK1: return BANK_1_8;
+    case T_BANK2: return BANK_9_16;
+    case T_RTN:   return BANK_RTN;
+    case T_BUS:   return BANK_BUS;
+    case T_DCA:   return BANK_DCA;
+  }
+  return -1;
+}
+
 void drawHomeTabs(LGFX_Sprite &s) {
   s.fillScreen(C_BG);
   const int w = 56;
@@ -1461,6 +1506,8 @@ void drawHomeTabs(LGFX_Sprite &s) {
     s.setTextDatum(middle_center);
     s.setTextColor(sel ? C_BG : C_DIM);
     s.drawString(HOME_TABS[i], x + w / 2, 21);
+    if (snap.fbConnected && tabBank(i) == snap.bank)  // the faders are on this tab
+      s.fillRect(x + w / 2 - 10, 32, 20, 3, sel ? C_BG : C_TEAL);
     zone(x - 2, 0, w + 4, 40, Z_TAB, 0, i);
   }
 }
@@ -1710,17 +1757,28 @@ void drawMixerInfo(LGFX_Sprite &s) {
     s.drawString(t, bx + 33, by + 14);
   }
   // settings
-  s.fillSmoothRoundRect(4, 214, 472, 56, 10, C_PANEL);
-  s.drawRoundRect(4, 214, 472, 56, 10, C_BORDER);
+  s.fillSmoothRoundRect(4, 214, 236, 56, 10, C_PANEL);
+  s.drawRoundRect(4, 214, 236, 56, 10, C_BORDER);
   drawGear(s, 34, 242, C_DIM, C_PANEL);
   s.setFont(&fonts::FreeSansBold12pt7b);
   s.setTextDatum(middle_left);
   s.setTextColor(C_TEXT);
   s.drawString("Settings", 58, 243);
+  // motorized fader board
+  s.fillSmoothRoundRect(246, 214, 230, 56, 10, C_PANEL);
   s.setFont(&fonts::DejaVu9);
-  s.setTextColor(C_FAINT);
-  s.drawString("Wi-Fi, touch calibration", 170, 244);
-  zone(4, 214, 472, 56, Z_GEAR);
+  s.setTextDatum(top_left);
+  s.setTextColor(C_DIM);
+  s.drawString("FADER BOARD", 256, 222);
+  char fb[40];
+  if (snap.fbConnected)
+    snprintf(fb, sizeof(fb), "%d faders, %s", snap.fbFaders, snap.fbHasTouch ? "touch sensor" : "motion touch");
+  else
+    snprintf(fb, sizeof(fb), "not connected");
+  s.setFont(&fonts::DejaVu12);
+  s.setTextColor(snap.fbConnected ? C_TEXT : C_FAINT);
+  s.drawString(fb, 256, 240);
+  zone(4, 214, 236, 56, Z_GEAR);
 }
 
 void drawHomeBody(LGFX_Sprite &s) {
@@ -1788,7 +1846,8 @@ void drawInsertPage(LGFX_Sprite &s) {
 
 uint32_t homeBodyHash() {
   Hash h;
-  h.add(homeTab).add(snap.sel).add(snap.editId).add(snap.editIdx);
+  h.add(homeTab).add(snap.sel).add(snap.editId).add(snap.editIdx).add(snap.bank).add(snap.fbConnected)
+   .add(snap.fbTouch).add(snap.fbFaders).add(snap.fbHasTouch);
   bool meters = homeTab <= T_BUS || homeTab == T_METERS;
   for (int i = 0; i < NUM_STRIPS; i++) {
     const StripView &v = snap.s[i];
@@ -2373,7 +2432,11 @@ void zoneTap(int x, int y, const char *&what) {
     case Z_MUTE_ANY: sendAction(UI_MUTE_ANY, 0, z.idx); what = "mute"; break;
     case Z_SETINS:   sendAction(UI_SET, P_INS_SLOT, z.idx); what = "insert"; break;
     case Z_MUTEGRP:  sendAction(UI_MUTEGRP, 0, z.idx); what = "mute group"; break;
-    case Z_TAB:      homeTab = z.idx; what = "tab"; break;
+    case Z_TAB:
+      homeTab = z.idx;
+      if (tabBank(z.idx) >= 0) sendAction(UI_BANK, 0, tabBank(z.idx));  // faders follow the tab
+      what = "tab";
+      break;
     case Z_OPEN_CH:
       sendAction(UI_SELECT, z.idx);
       channelOpen = true;
@@ -2742,7 +2805,7 @@ void drawPage() {
 
 void drawHome() {
   Job jobs[] = {
-    {&pHomeTabs, Hash().add(homeTab).h, drawHomeTabs},
+    {&pHomeTabs, Hash().add(homeTab).add(snap.bank).add(snap.fbConnected).h, drawHomeTabs},
     {&pHomeBody, homeBodyHash(), drawHomeBody},
   };
   runJobs(jobs, 2);
