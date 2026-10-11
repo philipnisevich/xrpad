@@ -15,7 +15,11 @@
 //   Fader n motor outputs      -> TC1508A motor A/B (two faders per board)
 //   Fader n touch track        -> MPR121 ELE0..ELE7
 //   MPR121                     SDA -> G47, SCL -> G48, VCC -> 3V3, GND
-//   Link to main board         TX G43 -> main G14, RX G44 <- main G13, GND
+//   Link to main board         TX G48 -> main G14, RX G47 <- main G13, GND
+//                              (G43/G44 aren't on the LCKFB board's headers.
+//                              With the MPR121 on G47/G48 the link moves to
+//                              TX G45 / RX G46; then unplug the link to flash
+//                              this board, as G46 held high blocks download mode.)
 //
 // Temporary 4-fader setup without an MPR121 (NATIVE_TOUCH): faders 1-4 only,
 // with their touch tracks on the ESP32's own touch pins G5..G8 (the wiper
@@ -44,7 +48,8 @@ const bool MOTOR_REVERSE[MAX_FADERS] = {false, false, false, false, false, false
 const bool POT_REVERSE[MAX_FADERS]   = {false, false, false, false, false, false, false, false};
 
 const uint8_t I2C_SDA = 47, I2C_SCL = 48;
-const uint8_t LINK_TX = 43, LINK_RX = 44;
+const uint8_t LINK_TX = NATIVE_TOUCH ? 48 : 45;  // G48 also lights the onboard LED
+const uint8_t LINK_RX = NATIVE_TOUCH ? 47 : 46;
 const uint32_t LINK_BAUD = 921600;
 
 const uint32_t MOTOR_PWM_HZ = 20000;  // above hearing
