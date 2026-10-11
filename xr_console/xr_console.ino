@@ -127,7 +127,24 @@ struct Detail {
   float dynThr, dynKnee, dynAtt, dynRel, dynMgain, dynMix;
   EqBand eq[4];
   float sends[10];   // bus 1-6, FX 1-4
+  int8_t insrc, fxslot, insOn;  // input source, insert FX slot (0 off, 1-8 FX1A..FX4B), insert on
 };
+
+// Everything that isn't a channel strip: FX returns 1-4, buses 1-6, FX sends
+// 1-4 and DCAs 1-4, shown on the home screen.
+const int NUM_OTHERS = 18, OTHER_RTN = 0, OTHER_BUS = 4, OTHER_FXSEND = 10, OTHER_DCA = 14;
+const int OTHER_PHONES = 18;  // P_OTHER index for the headphone level
+struct Other { char prefix[12]; char label[8]; char name[16]; float fader; int8_t on, color; };
+Other others[NUM_OTHERS];
+
+// Mixer-wide settings for the home screen (-1 = not reported yet).
+struct MixerInfo {
+  int8_t phonesSrc;
+  int8_t muteGrp[4], chLink[8], busLink[3], amix[2], fxType[4];
+  float phonesLevel;
+  int16_t snapIndex;
+  char snapName[24];
+} mixInfo;
 
 // Everything the encoder can edit. Index (idx) picks the EQ band or send.
 enum ParamId : uint8_t {
@@ -135,7 +152,7 @@ enum ParamId : uint8_t {
   P_EQON, P_EQ_TYPE, P_EQ_F, P_EQ_G, P_EQ_Q,
   P_GATE_ON, P_GATE_THR, P_GATE_RANGE, P_GATE_ATT, P_GATE_HOLD, P_GATE_REL,
   P_DYN_ON, P_DYN_THR, P_DYN_RATIO, P_DYN_KNEE, P_DYN_ATT, P_DYN_REL, P_DYN_MGAIN, P_DYN_MIX,
-  P_SEND, P_COUNT
+  P_SEND, P_OTHER, P_INS_SLOT, P_INS_ON, P_COUNT
 };
 
 // kind: 'f' 0-1 float in `steps` steps, 'i' int 0..steps, 'b' on/off,
@@ -171,6 +188,9 @@ const ParamInfo PARAMS[P_COUNT] = {
   {"/dyn/mgain", 'f', 48, "MAKEUP"},
   {"/dyn/mix", 'f', 20, "MIX"},
   {"/mix/%02d/level", 'F', 0, "SEND"},
+  {"", 'F', 0, "LEVEL"},               // others[idx] fader, or headphones
+  {"/insert/sel", 'i', 8, "INSERT"},  // the X-Air docs say insert/fxslot; the mixer answers sel
+  {"/insert/on", 'b', 1, "INSERT"},
 };
 
 // What the encoder edits; P_NONE = it changes channels.
@@ -180,6 +200,7 @@ Detail details[NUM_STRIPS];
 
 // Live input meters (dBFS).
 float meterDb[NUM_STRIPS];
+float allMeters[40];  // the whole /meters/1 block, for the home meter bridge
 uint32_t meterSeq = 0;
 
 void resetDetail(Detail &d) {
@@ -188,6 +209,7 @@ void resetDetail(Detail &d) {
   d.pan = d.gain = d.hpf = NAN;
   d.gateThr = d.gateRange = d.gateAtt = d.gateHold = d.gateRel = NAN;
   d.dynThr = d.dynKnee = d.dynAtt = d.dynRel = d.dynMgain = d.dynMix = NAN;
+  d.insrc = d.fxslot = d.insOn = -1;
   for (EqBand &b : d.eq) { b.type = -1; b.f = b.g = b.q = NAN; }
   for (float &s : d.sends) s = NAN;
 }
@@ -201,6 +223,20 @@ void initStrips() {
   strcpy(strips[AUX_STRIP].label, "AUX");
   strcpy(strips[MAIN_STRIP].prefix, "/lr");
   strcpy(strips[MAIN_STRIP].label, "MAIN");
+  for (int i = 0; i < NUM_OTHERS; i++) {
+    Other &o = others[i];
+    if (i < OTHER_BUS)         { snprintf(o.prefix, 12, "/rtn/%d", i + 1);    snprintf(o.label, 8, "FX %d", i + 1); }
+    else if (i < OTHER_FXSEND) { snprintf(o.prefix, 12, "/bus/%d", i - 3);    snprintf(o.label, 8, "BUS %d", i - 3); }
+    else if (i < OTHER_DCA)    { snprintf(o.prefix, 12, "/fxsend/%d", i - 9); snprintf(o.label, 8, "SND %d", i - 9); }
+    else                       { snprintf(o.prefix, 12, "/dca/%d", i - 13);   snprintf(o.label, 8, "DCA %d", i - 13); }
+    o.name[0] = 0;
+    o.fader = NAN;
+    o.on = o.color = -1;
+  }
+  memset(&mixInfo, -1, sizeof(mixInfo));
+  mixInfo.phonesLevel = NAN;
+  mixInfo.snapName[0] = 0;
+  for (float &m : allMeters) m = NAN;
   for (int i = 0; i < NUM_STRIPS; i++) {
     strips[i].on = -1;
     resetDetail(details[i]);
@@ -228,7 +264,8 @@ float dbToFader(float db) {
 SemaphoreHandle_t stateLock;
 
 // Touch actions from the TFT, handled by the main loop (which owns the network).
-enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO, UI_SCAN, UI_EDIT, UI_TOGGLE };
+enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO, UI_SCAN, UI_EDIT, UI_TOGGLE,
+                              UI_MUTE_ANY, UI_MUTEGRP, UI_SET };
 struct UiAction { UiActionType type; int8_t arg; uint8_t arg2; };
 QueueHandle_t uiQueue;
 void handleUiAction(const UiAction &a);
@@ -244,6 +281,9 @@ IPAddress mixerIp;
 volatile bool haveMixer = false;
 uint32_t lastRx = 0, lastXremote = 0, lastProbe = 0, lastQuery = 0, lastSend = 0;
 int sweepPos = -1;   // position in the all-strips query sweep, -1 = idle
+int extraPos = -1;   // position in the mixer-wide (home screen) queries
+uint32_t lastExtra = 0;
+const uint32_t EXTRA_EVERY_MS = 60000;
 bool sweepRepair = false;  // this pass only asks for what's still missing
 int sweepRepairs = 0;
 int detailPos = -1;  // position in the selected-strip query list, -1 = idle
@@ -474,6 +514,12 @@ void resetMixerState() {
     resetDetail(details[i]);
     meterDb[i] = NAN;
   }
+  for (Other &o : others) { o.name[0] = 0; o.fader = NAN; o.on = o.color = -1; }
+  memset(&mixInfo, -1, sizeof(mixInfo));
+  mixInfo.phonesLevel = NAN;
+  mixInfo.snapName[0] = 0;
+  for (float &m : allMeters) m = NAN;
+  extraPos = -1;
   detailDone = false;
   syncStart = 0;
   pickedUp = false;
@@ -711,6 +757,7 @@ void handleMeters(const uint8_t *arg, size_t argLen) {
     return max(v / 256.0f, -90.0f);
   };
   for (int i = 0; i < 16; i++) meterDb[i] = level(i);
+  for (int i = 0; i < 40 && i < (int)count; i++) allMeters[i] = level(i);
   meterDb[AUX_STRIP] = max(level(16), level(17));
   meterDb[MAIN_STRIP] = max(level(36), level(37));
   meterSeq++;
@@ -751,6 +798,9 @@ void applyDetail(int i, const char *suffix, const char *tags, const uint8_t *arg
   else if (!strcmp(suffix, "/dyn/mgain"))     d.dynMgain = v;
   else if (!strcmp(suffix, "/dyn/mix"))       d.dynMix = v;
   else if (!strcmp(suffix, "/eq/on"))         d.eqOn = iv;
+  else if (!strcmp(suffix, "/config/insrc"))  d.insrc = iv;
+  else if (!strcmp(suffix, "/insert/sel"))    d.fxslot = iv;
+  else if (!strcmp(suffix, "/insert/on"))     d.insOn = iv;
   else if (!strncmp(suffix, "/eq/", 4) && suffix[4] >= '1' && suffix[4] <= '4' && suffix[5] == '/') {
     EqBand &b = d.eq[suffix[4] - '1'];
     const char *p = suffix + 6;
@@ -762,6 +812,99 @@ void applyDetail(int i, const char *suffix, const char *tags, const uint8_t *arg
     int n = atoi(suffix + 5);
     if (n >= 1 && n <= 10) d.sends[n - 1] = v;
   }
+}
+
+// Index into others[] for /rtn/N, /bus/N, /fxsend/N, /dca/N (or -1), and
+// where the rest of the address starts.
+int otherFor(const char *address, const char **suffix) {
+  struct { const char *p; int base, count; } kinds[] = {
+    {"/rtn/", OTHER_RTN, 4}, {"/bus/", OTHER_BUS, 6}, {"/fxsend/", OTHER_FXSEND, 4}, {"/dca/", OTHER_DCA, 4},
+  };
+  for (auto &k : kinds) {
+    size_t n = strlen(k.p);
+    if (strncmp(address, k.p, n) || !isdigit((unsigned char)address[n])) continue;
+    int i = address[n] - '1';
+    if (i < 0 || i >= k.count || address[n + 1] != '/') return -1;
+    *suffix = address + n + 1;
+    return k.base + i;
+  }
+  return -1;
+}
+
+// Routing, buses, DCAs, FX, monitor and snapshot replies. True if handled.
+bool handleMixerWide(const char *address, const char *tags, const uint8_t *arg, size_t argLen) {
+  float v;
+  const char *suffix;
+  int oi = otherFor(address, &suffix);
+  if (oi >= 0) {
+    Other &o = others[oi];
+    if (!strcmp(suffix, "/config/name") && !strcmp(tags, ",s")) {
+      strlcpy(o.name, (const char *)arg, min(argLen + 1, sizeof(o.name)));
+    } else if (readNumber(tags, arg, argLen, v)) {
+      if (!strcmp(suffix, "/mix/fader") || !strcmp(suffix, "/fader")) o.fader = v;
+      else if (!strcmp(suffix, "/mix/on") || !strcmp(suffix, "/on")) o.on = (int8_t)v;
+      else if (!strcmp(suffix, "/config/color")) o.color = (int8_t)v;
+    }
+    return true;
+  }
+  MixerInfo &m = mixInfo;
+  if (!strncmp(address, "/-snap/", 7)) {
+    if (!strcmp(address + 7, "name") && !strcmp(tags, ",s"))
+      strlcpy(m.snapName, (const char *)arg, min(argLen + 1, sizeof(m.snapName)));
+    else if (!strcmp(address + 7, "index") && readNumber(tags, arg, argLen, v)) m.snapIndex = (int16_t)v;
+    return true;
+  }
+  if (!readNumber(tags, arg, argLen, v)) return false;
+  int8_t iv = (int8_t)v;
+  int n;
+  if (!strcmp(address, "/config/solo/level")) m.phonesLevel = v;
+  else if (!strcmp(address, "/config/solo/source")) m.phonesSrc = iv;
+  else if (sscanf(address, "/config/mute/%d", &n) == 1 && n >= 1 && n <= 4) m.muteGrp[n - 1] = iv;
+  else if (sscanf(address, "/config/chlink/%d", &n) == 1 && n >= 1 && n <= 15) m.chLink[n / 2] = iv;
+  else if (sscanf(address, "/config/buslink/%d", &n) == 1 && n >= 1 && n <= 5) m.busLink[n / 2] = iv;
+  else if (!strcmp(address, "/config/amixenable/X")) m.amix[0] = iv;
+  else if (!strcmp(address, "/config/amixenable/Y")) m.amix[1] = iv;
+  else if (sscanf(address, "/fx/%d/type", &n) == 1 && n >= 1 && n <= 4) m.fxType[n - 1] = iv;
+  else return false;
+  return true;
+}
+
+// Everything the home screen shows that the per-channel queries don't
+// cover. Returns false past the end.
+bool extraQuery(int idx, char *a, size_t n) {
+  static const char *const CH[] = {"/config/color", "/mix/pan", "/mix/lr", "/eq/on", "/gate/on",
+                                   "/dyn/on", "/config/insrc", "/insert/sel", "/insert/on"};
+  const int nCh = 9;
+  if (idx < 16 * nCh) { snprintf(a, n, "/ch/%02d%s", idx / nCh + 1, CH[idx % nCh]); return true; }
+  idx -= 16 * nCh;
+  static const char *const AUXLR[] = {"/rtn/aux/config/color", "/rtn/aux/mix/lr", "/rtn/aux/eq/on", "/lr/config/color"};
+  if (idx < 4) { snprintf(a, n, "%s", AUXLR[idx]); return true; }
+  idx -= 4;
+  if (idx < 16) { snprintf(a, n, "/headamp/%02d/phantom", idx + 1); return true; }
+  idx -= 16;
+  if (idx < 17) { snprintf(a, n, "/-stat/solosw/%02d", idx + 1); return true; }
+  idx -= 17;
+  if (idx < NUM_OTHERS * 4) {
+    const Other &o = others[idx / 4];
+    bool dca = idx / 4 >= OTHER_DCA;
+    static const char *const MIX[] = {"/config/name", "/mix/fader", "/mix/on", "/config/color"};
+    static const char *const DCA[] = {"/config/name", "/fader", "/on", "/config/color"};
+    snprintf(a, n, "%s%s", o.prefix, (dca ? DCA : MIX)[idx % 4]);
+    return true;
+  }
+  idx -= NUM_OTHERS * 4;
+  if (idx < 8) { snprintf(a, n, "/config/chlink/%d-%d", idx * 2 + 1, idx * 2 + 2); return true; }
+  idx -= 8;
+  if (idx < 3) { snprintf(a, n, "/config/buslink/%d-%d", idx * 2 + 1, idx * 2 + 2); return true; }
+  idx -= 3;
+  if (idx < 4) { snprintf(a, n, "/config/mute/%d", idx + 1); return true; }
+  idx -= 4;
+  if (idx < 4) { snprintf(a, n, "/fx/%d/type", idx + 1); return true; }
+  idx -= 4;
+  static const char *const MISC[] = {"/config/solo/level", "/config/solo/source", "/config/amixenable/X",
+                                     "/config/amixenable/Y", "/-snap/index", "/-snap/name"};
+  if (idx < 6) { snprintf(a, n, "%s", MISC[idx]); return true; }
+  return false;
 }
 
 void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
@@ -820,6 +963,7 @@ void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
     if (i >= 0 && readNumber(tags, arg, argLen, v)) details[i].solo = (int)v;
     return;
   }
+  if (handleMixerWide(address, tags, arg, argLen)) return;
 
   for (int i = 0; i < NUM_STRIPS; i++) {
     Strip &s = strips[i];
@@ -866,7 +1010,7 @@ bool detailQuery(int strip, int idx, char *addr, size_t size) {
     "/config/color", "/mix/on", "/mix/pan", "/mix/lr", "/preamp/hpon", "/preamp/hpf",
     "/preamp/invert", "/gate/on", "/gate/thr", "/gate/range", "/gate/attack", "/gate/hold",
     "/gate/release", "/dyn/on", "/dyn/thr", "/dyn/ratio", "/dyn/knee", "/dyn/attack",
-    "/dyn/release", "/dyn/mgain", "/dyn/mix", "/eq/on",
+    "/dyn/release", "/dyn/mgain", "/dyn/mix", "/eq/on", "/insert/sel", "/insert/on",
   };
   static const char *const EQ_PARAMS[] = {"type", "f", "g", "q"};
   const int nFixed = sizeof(FIXED) / sizeof(FIXED[0]);
@@ -932,6 +1076,17 @@ void runQueries(uint32_t now) {
       } else {
         sweepPos = -1;
       }
+    }
+    return;
+  }
+  // Last, the home screen's mixer-wide data.
+  if (extraPos >= 0 && now - lastQuery >= QUERY_GAP_MS) {
+    char addr[40];
+    if (extraQuery(extraPos++, addr, sizeof(addr))) {
+      lastQuery = now;
+      sendOsc(mixerIp, addr);
+    } else {
+      extraPos = -1;
     }
   }
 }
@@ -1007,6 +1162,13 @@ int inputNumber(int strip) { return strip == AUX_STRIP ? 17 : strip < 16 ? strip
 
 bool paramAddress(int strip, uint8_t id, uint8_t idx, char *addr, size_t size) {
   const ParamInfo &p = PARAMS[id];
+  if (id == P_OTHER) {
+    if (idx == OTHER_PHONES) snprintf(addr, size, "/config/solo/level");
+    else if (idx < NUM_OTHERS)
+      snprintf(addr, size, "%s%s", others[idx].prefix, idx >= OTHER_DCA ? "/fader" : "/mix/fader");
+    else return false;
+    return true;
+  }
   if (id == P_GAIN || id == P_PHANTOM) {
     int in = inputNumber(strip);
     if (!in) return false;
@@ -1033,6 +1195,8 @@ float paramValue(int strip, uint8_t id, uint8_t idx) {
     case P_HPON:       return i(d.hpOn);
     case P_HPF:        return d.hpf;
     case P_EQON:       return i(d.eqOn);
+    case P_INS_SLOT:   return i(d.fxslot);
+    case P_INS_ON:     return i(d.insOn);
     case P_EQ_TYPE:    return i(d.eq[idx & 3].type);
     case P_EQ_F:       return d.eq[idx & 3].f;
     case P_EQ_G:       return d.eq[idx & 3].g;
@@ -1052,6 +1216,8 @@ float paramValue(int strip, uint8_t id, uint8_t idx) {
     case P_DYN_MGAIN:  return d.dynMgain;
     case P_DYN_MIX:    return d.dynMix;
     case P_SEND:       return d.sends[idx % 10];
+    case P_OTHER:      return idx == OTHER_PHONES ? mixInfo.phonesLevel
+                            : idx < NUM_OTHERS ? others[idx].fader : NAN;
   }
   return NAN;
 }
@@ -1068,6 +1234,8 @@ void storeParam(int strip, uint8_t id, uint8_t idx, float v) {
     case P_HPON:       d.hpOn = iv; break;
     case P_HPF:        d.hpf = v; break;
     case P_EQON:       d.eqOn = iv; break;
+    case P_INS_SLOT:   d.fxslot = iv; break;
+    case P_INS_ON:     d.insOn = iv; break;
     case P_EQ_TYPE:    d.eq[idx & 3].type = iv; break;
     case P_EQ_F:       d.eq[idx & 3].f = v; break;
     case P_EQ_G:       d.eq[idx & 3].g = v; break;
@@ -1087,6 +1255,10 @@ void storeParam(int strip, uint8_t id, uint8_t idx, float v) {
     case P_DYN_MGAIN:  d.dynMgain = v; break;
     case P_DYN_MIX:    d.dynMix = v; break;
     case P_SEND:       d.sends[idx % 10] = v; break;
+    case P_OTHER:
+      if (idx == OTHER_PHONES) mixInfo.phonesLevel = v;
+      else if (idx < NUM_OTHERS) others[idx].fader = v;
+      break;
   }
 }
 
@@ -1158,7 +1330,8 @@ void resetParam() {
   static const float BAND_HZ[4] = {100.0f, 500.0f, 2000.0f, 8000.0f};
   float v;
   switch (id) {
-    case P_SEND:       v = 0.75f; break;                                   // 0 dB
+    case P_SEND:
+    case P_OTHER:      v = 0.75f; break;                                   // 0 dB
     case P_PAN:        v = 0.5f; break;                                    // centre
     case P_GAIN:       v = 12.0f / 72.0f; break;                           // 0 dB
     case P_HPF:        v = log10f(80.0f / 20.0f) / log10f(20.0f); break;  // 80 Hz
@@ -1206,12 +1379,43 @@ void handleUiAction(const UiAction &a) {
     editIdx = a.arg2;
     return;
   }
+  if (a.type == UI_SET) {  // set a parameter of the selected strip to a value (arg2)
+    if (haveMixer && a.arg == P_INS_SLOT && selected < 16) {
+      setParam(selected, P_INS_SLOT, 0, a.arg2);
+      if (a.arg2 && details[selected].insOn != 1) setParam(selected, P_INS_ON, 0, 1);  // inserting = on
+    }
+    return;
+  }
   if (a.type == UI_TOGGLE) {
     toggleParam(a.arg, a.arg2);
     return;
   }
   if (!haveMixer) return;
   char addr[32];
+  if (a.type == UI_MUTE_ANY) {  // arg2: 0-17 a channel strip, 32+ one of others[]
+    int8_t *on;
+    if (a.arg2 < NUM_STRIPS) {
+      on = &strips[a.arg2].on;
+      snprintf(addr, sizeof(addr), "%s/mix/on", strips[a.arg2].prefix);
+    } else if (a.arg2 >= 32 && a.arg2 < 32 + NUM_OTHERS) {
+      Other &o = others[a.arg2 - 32];
+      on = &o.on;
+      snprintf(addr, sizeof(addr), "%s%s", o.prefix, a.arg2 - 32 >= OTHER_DCA ? "/on" : "/mix/on");
+    } else return;
+    if (*on < 0) return;
+    *on = *on ? 0 : 1;
+    sendOsc(mixerIp, addr, 'i', *on);
+    dirty = true;
+    return;
+  }
+  if (a.type == UI_MUTEGRP) {
+    int g = a.arg2 & 3;
+    if (mixInfo.muteGrp[g] < 0) return;
+    mixInfo.muteGrp[g] = mixInfo.muteGrp[g] ? 0 : 1;
+    snprintf(addr, sizeof(addr), "/config/mute/%d", g + 1);
+    sendOsc(mixerIp, addr, 'i', mixInfo.muteGrp[g]);
+    return;
+  }
   if (a.type == UI_MUTE) {
     Strip &s = strips[selected];
     if (s.on < 0) return;
@@ -1477,6 +1681,11 @@ void loop() {
       if (detailPos < 0) {                           // and the selected one
         detailStrip = selected;
         detailPos = 0;
+      }
+      // Everything else (routing, buses, FX, ...) on connect and every minute
+      if (extraPos < 0 && (lastExtra == 0 || now - lastExtra > EXTRA_EVERY_MS)) {
+        extraPos = 0;
+        lastExtra = now;
       }
     }
     runQueries(now);
