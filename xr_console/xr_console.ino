@@ -1680,8 +1680,14 @@ void faderBoardBegin() {
 void readFaderBoard(uint32_t now) {
   static char buf[96];
   static int len = 0;
+  static uint32_t rxBytes = 0, lastDebug = 0;  // DEBUG: link status every 3 s
+  if (now - lastDebug >= 3000) {
+    lastDebug = now;
+    Serial.printf("[%lu] fader link: rx %lu bytes, %s\n", now, rxBytes, fbConnected ? "connected" : "no board");
+  }
   while (Serial1.available()) {
     char c = Serial1.read();
+    rxBytes++;
     if (c != '\n' && c != '\r') {
       if (len < (int)sizeof(buf) - 1) buf[len++] = c;
       continue;
