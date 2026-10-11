@@ -17,18 +17,25 @@
 //   MPR121                     SDA -> G47, SCL -> G48, VCC -> 3V3, GND
 //   Link to main board         TX G43 -> main G14, RX G44 <- main G13, GND
 //
+// Temporary 4-fader setup without an MPR121 (NATIVE_TOUCH): faders 1-4 only,
+// with their touch tracks on the ESP32's own touch pins G5..G8 (the wiper
+// pins of faders 5-8, which are unused then). Keep these wires short.
+//
 // Protocol (921600 baud, text lines):
 //   main -> board  "T <n> <pos>"  move fader n (0-7) to pos 0-1000; pos < 0 = no target
 //                  "C"            recalibrate all faders
 //                  "?"            ask for the hello line
-//   board -> main  "H <faders> <mpr121>"           hello (at boot and on "?")
+//   board -> main  "H <faders> <touch sensor>"     hello (at boot and on "?")
 //                  "S <touchmask> <p0> ... <p7>"   every 20 ms, positions 0-1000
 
 #include <Wire.h>
 #include <Adafruit_MPR121.h>
 
 const int MAX_FADERS = 8;
-const int FADERS = 8;  // how many are fitted (1 for testing with a single fader)
+const int FADERS = 4;               // how many are fitted (1 for testing with a single fader)
+const bool NATIVE_TOUCH = true;     // true: touch on G5-G8 (4 faders max); false: MPR121
+const uint8_t TOUCH_PIN[4] = {5, 6, 7, 8};
+static_assert(!NATIVE_TOUCH || FADERS <= 4, "native touch uses fader 5-8's wiper pins: 4 faders max");
 
 const uint8_t WIPER[MAX_FADERS] = {1, 2, 3, 4, 5, 6, 7, 8};
 const uint8_t IN1[MAX_FADERS]   = {9, 10, 11, 12, 13, 14, 15, 16};   // PWM
@@ -58,8 +65,10 @@ const uint32_t CAL_DRIVE_MS = 500;
 const float    CAL_END_GAP = 0.015f;    // -inf/+10 dB sit this far in from the end stops
 const int      CAL_MIN_SPAN = 1800;     // raw ADC counts; less = calibration failed
 
-const uint32_t TOUCH_READ_MS = 5;
+const uint32_t TOUCH_READ_MS = 15;
 const uint32_t TOUCH_HOLD_MS = 150;     // stay "touched" briefly after letting go
+const float    TOUCH_ON = 0.15f;        // native touch: this far above baseline = touched
+const float    TOUCH_OFF = 0.08f;       // ...and below this = released
 const uint32_t REPORT_MS = 20;
 
 // Without an MPR121, a hand is detected by the fader moving while its motor
@@ -74,8 +83,9 @@ struct Fader {
   bool moving = false, breakaway = false, touched = false;
   float startErr = 0, bestErr = 0;
   uint32_t startAt = 0, progressAt = 0, brakeUntil = 0, releasedAt = 0;
-  float restPos = -1;                // no-MPR121 hand detection
+  float restPos = -1;                // no-sensor hand detection
   uint32_t movedAt = 0;
+  float touchBase = 0;               // native touch: untouched reading
 };
 
 Fader faders[MAX_FADERS];
@@ -199,12 +209,36 @@ void calibrate() {
 
 // ---------- touch ----------
 
+// Native touch: a finger only raises the reading, so the baseline drops to
+// any lower reading at once and follows upward drift slowly while untouched.
+bool nativeTouched(Fader &f, int n) {
+  float v = touchRead(TOUCH_PIN[n]);
+  bool over = v > f.touchBase * (1.0f + (f.touched ? TOUCH_OFF : TOUCH_ON));
+  if (!over) {
+    if (v < f.touchBase) f.touchBase = v;
+    else if (v < f.touchBase * (1.0f + TOUCH_OFF)) f.touchBase += 0.02f * (v - f.touchBase);
+  }
+  return over;
+}
+
+void calibrateNativeTouch() {
+  for (int n = 0; n < FADERS; n++) {
+    for (int k = 0; k < 5; k++) touchRead(TOUCH_PIN[n]);  // first readings after boot run high
+    float sum = 0;
+    for (int k = 0; k < 8; k++) sum += touchRead(TOUCH_PIN[n]);
+    faders[n].touchBase = sum / 8;
+    Serial.printf("fader %d touch baseline %.0f\n", n + 1, faders[n].touchBase);
+  }
+}
+
 void updateTouch(uint32_t now) {
   uint16_t mask = haveMpr ? mpr.touched() : 0;
   for (int n = 0; n < FADERS; n++) {
     Fader &f = faders[n];
     bool raw;
-    if (haveMpr) {
+    if (NATIVE_TOUCH) {
+      raw = nativeTouched(f, n);
+    } else if (haveMpr) {
       raw = mask & (1 << n);
     } else if (f.moving || f.brakeUntil || f.smooth < 0) {
       f.restPos = f.smooth;  // the motor is moving it, not a hand
@@ -230,7 +264,7 @@ void updateTouch(uint32_t now) {
 
 // ---------- link ----------
 
-void sendHello() { Serial1.printf("H %d %d\n", FADERS, haveMpr ? 1 : 0); }
+void sendHello() { Serial1.printf("H %d %d\n", FADERS, NATIVE_TOUCH || haveMpr ? 1 : 0); }
 
 void handleLine(char *line) {
   if (line[0] == 'T') {
@@ -282,10 +316,15 @@ void setup() {
     ledcAttach(IN1[n], MOTOR_PWM_HZ, MOTOR_PWM_BITS);
     coast(n);
   }
-  Wire.begin(I2C_SDA, I2C_SCL);
-  haveMpr = mpr.begin(0x5A, &Wire);
-  Serial.printf("Fader board: %d faders, MPR121 %s\n", FADERS,
-                haveMpr ? "found" : "not found (detecting hands by motion)");
+  if (NATIVE_TOUCH) {
+    Serial.printf("Fader board: %d faders, touch on G5-G8\n", FADERS);
+    calibrateNativeTouch();  // before the motors run, with no hands on the faders
+  } else {
+    Wire.begin(I2C_SDA, I2C_SCL);
+    haveMpr = mpr.begin(0x5A, &Wire);
+    Serial.printf("Fader board: %d faders, MPR121 %s\n", FADERS,
+                  haveMpr ? "found" : "not found (detecting hands by motion)");
+  }
   calibrate();
   sendHello();
 }
