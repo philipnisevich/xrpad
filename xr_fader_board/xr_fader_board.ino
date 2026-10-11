@@ -68,6 +68,7 @@ const uint32_t MOTOR_BREAKAWAY_MS = 60;
 const uint32_t MOTOR_END_MS = 80;
 const uint32_t MOTOR_TIMEOUT_MS = 1500;
 const uint32_t MOTOR_STAGGER_MS = 25;    // start delay between faders moving together
+const uint32_t FOLLOW_MS = 300;          // targets closer together than this = a stream to follow
 
 const uint32_t CAL_DRIVE_MS = 500;
 const float    CAL_END_GAP = 0.015f;    // -inf/+10 dB sit this far in from the end stops
@@ -102,6 +103,8 @@ struct Fader {
   uint32_t startAfter = 0;           // staggered start of a move
   uint32_t checkAt = 0;              // when to check where a move really stopped
   uint8_t corrections = 0;           // settle-back nudges used by this move
+  bool following = false;            // tracking a stream of targets (see followTarget)
+  uint32_t lastTargetAt = 0;
   bool enabled = false;              // calibrated; a fader that failed is never driven
   bool flip = false;                 // motor wired the other way round (found at calibration)
 };
@@ -161,12 +164,42 @@ void startMove(int n, float target) {
   f.startErr = f.bestErr = fabsf(target - f.smooth);
 }
 
+// Steer towards a target that's part of a stream: keep driving (no
+// full-power restart, no braking), just aim at the newest value.
+void followTarget(int n, float target, uint32_t now) {
+  Fader &f = faders[n];
+  f.target = target;
+  f.following = true;
+  f.checkAt = 0;
+  f.brakeUntil = 0;
+  if (!f.moving) {
+    if (fabsf(target - f.smooth) <= MOTOR_TOL) return;
+    f.moving = true;
+    f.breakaway = false;
+    f.startAfter = now;
+  }
+  f.startAt = f.progressAt = now;
+  f.startErr = f.bestErr = fabsf(target - f.smooth);
+}
+
 void updateFader(int n, uint32_t now) {
   Fader &f = faders[n];
   float pos = readPosition(n);
   f.smooth = f.smooth < 0 ? pos : f.smooth + 0.3f * (pos - f.smooth);
 
   if (f.brakeUntil && now >= f.brakeUntil) { coast(n); f.brakeUntil = 0; }
+
+  // The stream has stopped: finish on the last target precisely.
+  if (f.following && now - f.lastTargetAt > FOLLOW_MS) {
+    f.following = false;
+    if (!f.moving && !f.touched && f.target >= 0 && fabsf(f.target - f.smooth) > MOTOR_TOL * 2) {
+      f.moving = true;
+      f.breakaway = false;
+      f.corrections = 0;
+      f.startAfter = f.startAt = f.progressAt = now;
+      f.startErr = f.bestErr = fabsf(f.target - f.smooth);
+    }
+  }
 
   // A fast move can coast past the target after braking: once it has
   // stopped, nudge it back gently (no full-power start), a few times at most.
@@ -201,11 +234,15 @@ void updateFader(int n, uint32_t now) {
     coast(n);
     f.moving = false;
   } else if (!endTarget && fabsf(err) <= MOTOR_TOL) {
-    brake(n);
-    f.brakeUntil = now + MOTOR_BRAKE_MS;
     f.moving = false;
-    f.checkAt = now + MOTOR_BRAKE_MS + MOTOR_SETTLE_CHECK_MS;  // see where it actually stopped
-  } else if (now - f.startAt > 60 && fabsf(err) > f.startErr + 0.03f) {
+    if (f.following) {
+      coast(n);  // the next target is on its way: no braking jolt
+    } else {
+      brake(n);
+      f.brakeUntil = now + MOTOR_BRAKE_MS;
+      f.checkAt = now + MOTOR_BRAKE_MS + MOTOR_SETTLE_CHECK_MS;  // see where it actually stopped
+    }
+  } else if (!f.following && now - f.startAt > 60 && fabsf(err) > f.startErr + 0.03f) {
     // Going the wrong way. Calibration finds each motor's direction, so this
     // is almost always a hand pulling the fader: let go of it. (Reversing
     // the motor here once made a correctly-wired fader permanently backwards.)
@@ -457,7 +494,15 @@ void motorTask(void *) {
         // The main board re-sends targets every couple of seconds in case a
         // line was lost. Only a changed target moves the fader; re-chasing the
         // same one made a fader that settles slightly off click every resend.
-        if (!motorsOff && t != f.target) startMove(n, t);
+        if (!motorsOff && t != f.target) {
+          // A stream of targets (a linked channel or the app's fader being
+          // moved): steer towards the latest one instead of restarting the
+          // move each time, which made the fader lurch.
+          bool stream = now - f.lastTargetAt < FOLLOW_MS;
+          if (stream && f.enabled && !f.touched && t >= 0 && f.smooth >= 0) followTarget(n, t, now);
+          else startMove(n, t);
+          f.lastTargetAt = now;
+        }
       }
       if (motorsOff && faders[n].moving) { faders[n].moving = false; coast(n); }
       updateFader(n, now);

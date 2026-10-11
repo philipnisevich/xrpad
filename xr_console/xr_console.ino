@@ -1732,6 +1732,15 @@ void applyBankFader(int i, const BankItem &it, float pos, uint32_t now) {
     s.sendDue = s.needsFinal = true;
     s.lockedUntil = now + LOCK_MS;
     if (it.idx == selected && !touched) requestMove();  // the console's own fader follows
+    // A linked channel (stereo pair): the mixer moves its partner too, but
+    // its updates arrive late and in steps. Move the partner's level here
+    // straight away, so its fader glides along, and ignore the echoes.
+    if (it.idx < 16 && mixInfo.chLink[it.idx / 2] == 1) {
+      Strip &p = strips[it.idx ^ 1];
+      p.fader = pos;
+      p.lockedUntil = now + LOCK_MS;
+      if ((it.idx ^ 1) == selected && !touched) requestMove();
+    }
     dirty = true;
   } else if (it.kind == 2 && now - fbOtherSentAt[i] >= FB_OTHER_GAP_MS) {
     fbOtherSentAt[i] = now;
