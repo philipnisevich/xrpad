@@ -4,9 +4,11 @@
 // fader drives itself to that channel's level, and follows changes made from
 // the app; moving it by hand sets the level. The OLED shows a compact
 // readout, and the 4.0" TFT (ui.h) shows everything about the selected
-// channel: level and live meter, EQ curve, gate/compressor, preamp, pan,
-// sends, input history and an overview of all channels. Tap the TFT to mute,
-// solo or select a channel.
+// channel: level and live meter, EQ curve, gate and compressor curves,
+// preamp, pan, sends and an overview of all channels. Tap any setting on the
+// TFT to point the encoder at it (tap it again to go back to changing
+// channels; press the encoder to reset it); EQ, gate, compressor and sends
+// are edited on their own pages, opened by tapping their section.
 //
 // Wi-Fi is chosen on the TFT: at boot the board scans and joins the most
 // recently used saved network that's in range, otherwise it shows a network
@@ -41,6 +43,7 @@
 
 const uint8_t  ENC_CLK      = 6;
 const uint8_t  ENC_DT       = 5;
+const uint8_t  ENC_SW       = 4;      // encoder push: reset the setting being edited
 const uint8_t  POT_PIN      = 7;      // must be ADC1 (G1-G10); ADC2 is unusable with Wi-Fi
 const uint8_t  TOUCH_PIN    = 10;     // any of G1-G14 can sense touch
 const bool     TOUCH_ENABLED = true;  // false = fader always live (no touch wire)
@@ -119,24 +122,72 @@ struct EqBand {
 
 struct Detail {
   int8_t color, lr, phantom, hpOn, invert, gateOn, dynOn, dynRatio, eqOn, solo;
-  float pan, gain, hpf, gateThr, dynThr;
+  float pan, gain, hpf;
+  float gateThr, gateRange, gateAtt, gateHold, gateRel;
+  float dynThr, dynKnee, dynAtt, dynRel, dynMgain, dynMix;
   EqBand eq[4];
   float sends[10];   // bus 1-6, FX 1-4
 };
 
+// Everything the encoder can edit. Index (idx) picks the EQ band or send.
+enum ParamId : uint8_t {
+  P_NONE, P_FADER, P_PAN, P_GAIN, P_PHANTOM, P_INVERT, P_LR, P_HPON, P_HPF,
+  P_EQON, P_EQ_TYPE, P_EQ_F, P_EQ_G, P_EQ_Q,
+  P_GATE_ON, P_GATE_THR, P_GATE_RANGE, P_GATE_ATT, P_GATE_HOLD, P_GATE_REL,
+  P_DYN_ON, P_DYN_THR, P_DYN_RATIO, P_DYN_KNEE, P_DYN_ATT, P_DYN_REL, P_DYN_MGAIN, P_DYN_MIX,
+  P_SEND, P_COUNT
+};
+
+// kind: 'f' 0-1 float in `steps` steps, 'i' int 0..steps, 'b' on/off,
+// 'F' fader-law level (stepped in dB). %d in the suffix is the band/send.
+struct ParamInfo { const char *suffix; char kind; int steps; const char *name; };
+const ParamInfo PARAMS[P_COUNT] = {
+  {"", 0, 0, ""},
+  {"/mix/fader", 'F', 0, "FADER"},
+  {"/mix/pan", 'f', 100, "PAN"},
+  {"gain", 'f', 144, "GAIN"},          // /headamp/NN/gain
+  {"phantom", 'b', 1, "48V"},          // /headamp/NN/phantom
+  {"/preamp/invert", 'b', 1, "INVERT"},
+  {"/mix/lr", 'b', 1, "LR"},
+  {"/preamp/hpon", 'b', 1, "LOW CUT"},
+  {"/preamp/hpf", 'f', 100, "LOW CUT FREQ"},
+  {"/eq/on", 'b', 1, "EQ"},
+  {"/eq/%d/type", 'i', 5, "TYPE"},
+  {"/eq/%d/f", 'f', 200, "FREQ"},
+  {"/eq/%d/g", 'f', 120, "GAIN"},
+  {"/eq/%d/q", 'f', 71, "Q"},
+  {"/gate/on", 'b', 1, "GATE"},
+  {"/gate/thr", 'f', 160, "THRESHOLD"},
+  {"/gate/range", 'f', 57, "RANGE"},
+  {"/gate/attack", 'f', 120, "ATTACK"},
+  {"/gate/hold", 'f', 100, "HOLD"},
+  {"/gate/release", 'f', 100, "RELEASE"},
+  {"/dyn/on", 'b', 1, "COMP"},
+  {"/dyn/thr", 'f', 120, "THRESHOLD"},
+  {"/dyn/ratio", 'i', 11, "RATIO"},
+  {"/dyn/knee", 'f', 5, "KNEE"},
+  {"/dyn/attack", 'f', 120, "ATTACK"},
+  {"/dyn/release", 'f', 100, "RELEASE"},
+  {"/dyn/mgain", 'f', 48, "MAKEUP"},
+  {"/dyn/mix", 'f', 20, "MIX"},
+  {"/mix/%02d/level", 'F', 0, "SEND"},
+};
+
+// What the encoder edits; P_NONE = it changes channels.
+volatile uint8_t editId = P_NONE, editIdx = 0;
+
 Detail details[NUM_STRIPS];
 
-// Live input meters (dBFS) and a scrolling history of each strip.
-const int HIST_LEN = 220;
+// Live input meters (dBFS).
 float meterDb[NUM_STRIPS];
-int8_t hist[NUM_STRIPS][HIST_LEN];
-uint16_t histHead = 0;
 uint32_t meterSeq = 0;
 
 void resetDetail(Detail &d) {
   d.color = d.lr = d.phantom = d.hpOn = d.invert = d.gateOn = d.dynOn = -1;
   d.dynRatio = d.eqOn = d.solo = -1;
-  d.pan = d.gain = d.hpf = d.gateThr = d.dynThr = NAN;
+  d.pan = d.gain = d.hpf = NAN;
+  d.gateThr = d.gateRange = d.gateAtt = d.gateHold = d.gateRel = NAN;
+  d.dynThr = d.dynKnee = d.dynAtt = d.dynRel = d.dynMgain = d.dynMix = NAN;
   for (EqBand &b : d.eq) { b.type = -1; b.f = b.g = b.q = NAN; }
   for (float &s : d.sends) s = NAN;
 }
@@ -154,7 +205,6 @@ void initStrips() {
     strips[i].on = -1;
     resetDetail(details[i]);
     meterDb[i] = NAN;
-    memset(hist[i], -128, HIST_LEN);
   }
 }
 
@@ -178,10 +228,14 @@ float dbToFader(float db) {
 SemaphoreHandle_t stateLock;
 
 // Touch actions from the TFT, handled by the main loop (which owns the network).
-enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO, UI_SCAN };
-struct UiAction { UiActionType type; int8_t arg; };
+enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO, UI_SCAN, UI_EDIT, UI_TOGGLE };
+struct UiAction { UiActionType type; int8_t arg; uint8_t arg2; };
 QueueHandle_t uiQueue;
 void handleUiAction(const UiAction &a);
+extern char editLockAddr[40];
+extern uint32_t editLockUntil;
+void toggleParam(uint8_t id, uint8_t idx);
+void editParam(int clicks, bool fast);
 
 // ---------- network state ----------
 
@@ -659,8 +713,6 @@ void handleMeters(const uint8_t *arg, size_t argLen) {
   for (int i = 0; i < 16; i++) meterDb[i] = level(i);
   meterDb[AUX_STRIP] = max(level(16), level(17));
   meterDb[MAIN_STRIP] = max(level(36), level(37));
-  for (int i = 0; i < NUM_STRIPS; i++) hist[i][histHead] = (int8_t)max(meterDb[i], -127.0f);
-  histHead = (histHead + 1) % HIST_LEN;
   meterSeq++;
 }
 
@@ -686,9 +738,18 @@ void applyDetail(int i, const char *suffix, const char *tags, const uint8_t *arg
   else if (!strcmp(suffix, "/preamp/invert")) d.invert = iv;
   else if (!strcmp(suffix, "/gate/on"))       d.gateOn = iv;
   else if (!strcmp(suffix, "/gate/thr"))      d.gateThr = v;
+  else if (!strcmp(suffix, "/gate/range"))    d.gateRange = v;
+  else if (!strcmp(suffix, "/gate/attack"))   d.gateAtt = v;
+  else if (!strcmp(suffix, "/gate/hold"))     d.gateHold = v;
+  else if (!strcmp(suffix, "/gate/release"))  d.gateRel = v;
   else if (!strcmp(suffix, "/dyn/on"))        d.dynOn = iv;
   else if (!strcmp(suffix, "/dyn/thr"))       d.dynThr = v;
   else if (!strcmp(suffix, "/dyn/ratio"))     d.dynRatio = iv;
+  else if (!strcmp(suffix, "/dyn/knee"))      d.dynKnee = v;
+  else if (!strcmp(suffix, "/dyn/attack"))    d.dynAtt = v;
+  else if (!strcmp(suffix, "/dyn/release"))   d.dynRel = v;
+  else if (!strcmp(suffix, "/dyn/mgain"))     d.dynMgain = v;
+  else if (!strcmp(suffix, "/dyn/mix"))       d.dynMix = v;
   else if (!strcmp(suffix, "/eq/on"))         d.eqOn = iv;
   else if (!strncmp(suffix, "/eq/", 4) && suffix[4] >= '1' && suffix[4] <= '4' && suffix[5] == '/') {
     EqBand &b = d.eq[suffix[4] - '1'];
@@ -740,6 +801,10 @@ void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
     handleMeters(arg, argLen);
     return;
   }
+
+  // While the encoder is changing something, ignore the mixer's (possibly
+  // older) copies of it so the value doesn't jump back.
+  if (millis() < editLockUntil && !strcmp(address, editLockAddr)) return;
 
   float v;
   if (strncmp(address, "/headamp/", 9) == 0) {
@@ -799,7 +864,9 @@ void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
 bool detailQuery(int strip, int idx, char *addr, size_t size) {
   static const char *const FIXED[] = {
     "/config/color", "/mix/on", "/mix/pan", "/mix/lr", "/preamp/hpon", "/preamp/hpf",
-    "/preamp/invert", "/gate/on", "/gate/thr", "/dyn/on", "/dyn/thr", "/dyn/ratio", "/eq/on",
+    "/preamp/invert", "/gate/on", "/gate/thr", "/gate/range", "/gate/attack", "/gate/hold",
+    "/gate/release", "/dyn/on", "/dyn/thr", "/dyn/ratio", "/dyn/knee", "/dyn/attack",
+    "/dyn/release", "/dyn/mgain", "/dyn/mix", "/eq/on",
   };
   static const char *const EQ_PARAMS[] = {"type", "f", "g", "q"};
   const int nFixed = sizeof(FIXED) / sizeof(FIXED[0]);
@@ -877,6 +944,7 @@ void runQueries(uint32_t now) {
 volatile int8_t encEdges = 0;
 volatile uint8_t encState = 0b11;
 volatile int32_t encClicks = 0;
+volatile uint32_t encLastClickAt = 0, encClickGap = UINT32_MAX;
 portMUX_TYPE encMux = portMUX_INITIALIZER_UNLOCKED;
 
 void IRAM_ATTR onEncoder() {
@@ -886,18 +954,36 @@ void IRAM_ATTR onEncoder() {
   encState = ((encState << 2) | ab) & 0x0F;
   encEdges += TABLE[encState];
   if (ab == 0b11) {  // back at rest
-    if (encEdges >= 2 || encEdges <= -2) encClicks += encEdges > 0 ? 1 : -1;
+    if (encEdges >= 2 || encEdges <= -2) {
+      encClicks += encEdges > 0 ? 1 : -1;
+      uint32_t t = millis();
+      encClickGap = t - encLastClickAt;
+      encLastClickAt = t;
+    }
     encEdges = 0;
   }
   portEXIT_CRITICAL_ISR(&encMux);
 }
 
-int takeClicks() {
+int takeClicks(uint32_t &gap) {
   portENTER_CRITICAL(&encMux);
   int clicks = encClicks;
   encClicks = 0;
+  gap = encClickGap;
   portEXIT_CRITICAL(&encMux);
   return ENC_REVERSE ? -clicks : clicks;
+}
+
+bool encButtonPressed() {
+  static bool stable = HIGH, lastRead = HIGH;
+  static uint32_t changedAt = 0;
+  bool r = digitalRead(ENC_SW);
+  if (r != lastRead) { lastRead = r; changedAt = millis(); }
+  if (millis() - changedAt > 30 && r != stable) {
+    stable = r;
+    return stable == LOW;
+  }
+  return false;
 }
 
 void selectStrip(int i) {
@@ -912,6 +998,200 @@ void selectStrip(int i) {
   Serial.printf("[%lu] select %s \"%s\"\n", millis(), s.label, s.name);
 }
 
+// ---------- parameter editing ----------
+
+char editLockAddr[40] = "";
+uint32_t editLockUntil = 0;
+
+int inputNumber(int strip) { return strip == AUX_STRIP ? 17 : strip < 16 ? strip + 1 : 0; }
+
+bool paramAddress(int strip, uint8_t id, uint8_t idx, char *addr, size_t size) {
+  const ParamInfo &p = PARAMS[id];
+  if (id == P_GAIN || id == P_PHANTOM) {
+    int in = inputNumber(strip);
+    if (!in) return false;
+    snprintf(addr, size, "/headamp/%02d/%s", in, p.suffix);
+    return true;
+  }
+  char suffix[24];
+  snprintf(suffix, sizeof(suffix), p.suffix, idx + 1);
+  snprintf(addr, size, "%s%s", strips[strip].prefix, suffix);
+  return true;
+}
+
+// The stored value of a parameter (NAN if the mixer hasn't reported it).
+float paramValue(int strip, uint8_t id, uint8_t idx) {
+  const Detail &d = details[strip];
+  auto i = [](int8_t v) { return v < 0 ? NAN : (float)v; };
+  switch (id) {
+    case P_FADER:      return strips[strip].haveFader ? strips[strip].fader : NAN;
+    case P_PAN:        return d.pan;
+    case P_GAIN:       return d.gain;
+    case P_PHANTOM:    return i(d.phantom);
+    case P_INVERT:     return i(d.invert);
+    case P_LR:         return i(d.lr);
+    case P_HPON:       return i(d.hpOn);
+    case P_HPF:        return d.hpf;
+    case P_EQON:       return i(d.eqOn);
+    case P_EQ_TYPE:    return i(d.eq[idx & 3].type);
+    case P_EQ_F:       return d.eq[idx & 3].f;
+    case P_EQ_G:       return d.eq[idx & 3].g;
+    case P_EQ_Q:       return d.eq[idx & 3].q;
+    case P_GATE_ON:    return i(d.gateOn);
+    case P_GATE_THR:   return d.gateThr;
+    case P_GATE_RANGE: return d.gateRange;
+    case P_GATE_ATT:   return d.gateAtt;
+    case P_GATE_HOLD:  return d.gateHold;
+    case P_GATE_REL:   return d.gateRel;
+    case P_DYN_ON:     return i(d.dynOn);
+    case P_DYN_THR:    return d.dynThr;
+    case P_DYN_RATIO:  return i(d.dynRatio);
+    case P_DYN_KNEE:   return d.dynKnee;
+    case P_DYN_ATT:    return d.dynAtt;
+    case P_DYN_REL:    return d.dynRel;
+    case P_DYN_MGAIN:  return d.dynMgain;
+    case P_DYN_MIX:    return d.dynMix;
+    case P_SEND:       return d.sends[idx % 10];
+  }
+  return NAN;
+}
+
+void storeParam(int strip, uint8_t id, uint8_t idx, float v) {
+  Detail &d = details[strip];
+  int8_t iv = (int8_t)lroundf(v);
+  switch (id) {
+    case P_PAN:        d.pan = v; break;
+    case P_GAIN:       d.gain = v; break;
+    case P_PHANTOM:    d.phantom = iv; break;
+    case P_INVERT:     d.invert = iv; break;
+    case P_LR:         d.lr = iv; break;
+    case P_HPON:       d.hpOn = iv; break;
+    case P_HPF:        d.hpf = v; break;
+    case P_EQON:       d.eqOn = iv; break;
+    case P_EQ_TYPE:    d.eq[idx & 3].type = iv; break;
+    case P_EQ_F:       d.eq[idx & 3].f = v; break;
+    case P_EQ_G:       d.eq[idx & 3].g = v; break;
+    case P_EQ_Q:       d.eq[idx & 3].q = v; break;
+    case P_GATE_ON:    d.gateOn = iv; break;
+    case P_GATE_THR:   d.gateThr = v; break;
+    case P_GATE_RANGE: d.gateRange = v; break;
+    case P_GATE_ATT:   d.gateAtt = v; break;
+    case P_GATE_HOLD:  d.gateHold = v; break;
+    case P_GATE_REL:   d.gateRel = v; break;
+    case P_DYN_ON:     d.dynOn = iv; break;
+    case P_DYN_THR:    d.dynThr = v; break;
+    case P_DYN_RATIO:  d.dynRatio = iv; break;
+    case P_DYN_KNEE:   d.dynKnee = v; break;
+    case P_DYN_ATT:    d.dynAtt = v; break;
+    case P_DYN_REL:    d.dynRel = v; break;
+    case P_DYN_MGAIN:  d.dynMgain = v; break;
+    case P_DYN_MIX:    d.dynMix = v; break;
+    case P_SEND:       d.sends[idx % 10] = v; break;
+  }
+}
+
+// Store locally, send to the mixer, and ignore its echoes for a moment.
+void setParam(int strip, uint8_t id, uint8_t idx, float v) {
+  char addr[40];
+  if (!paramAddress(strip, id, idx, addr, sizeof(addr))) return;
+  storeParam(strip, id, idx, v);
+  char kind = PARAMS[id].kind;
+  if (kind == 'f' || kind == 'F') {
+    uint32_t raw;
+    memcpy(&raw, &v, 4);
+    sendOsc(mixerIp, addr, 'f', raw);
+  } else {
+    sendOsc(mixerIp, addr, 'i', (uint32_t)(int32_t)lroundf(v));
+  }
+  strlcpy(editLockAddr, addr, sizeof(editLockAddr));
+  editLockUntil = millis() + 500;
+}
+
+// Fader-law levels step in dB, like a real fader: 0.5 dB, 2 dB when fast.
+float stepFaderLaw(float f, int clicks, bool fast) {
+  float step = fast ? 2.0f : 0.5f;
+  float db = f <= 0.0f ? -90.0f : faderToDb(f);
+  db = constrain(roundf(db / step) * step + clicks * step, -90.0f, 10.0f);
+  float nf = db <= -90.0f ? 0.0f : roundf(dbToFader(db) * 1023.0f) / 1023.0f;
+  if (nf == f) nf = constrain(roundf(f * 1023.0f) + (clicks > 0 ? 1 : -1), 0.0f, 1023.0f) / 1023.0f;
+  return nf;
+}
+
+void editParam(int clicks, bool fast) {
+  uint8_t id = editId, idx = editIdx;
+  if (id == P_FADER) {
+    Strip &s = strips[selected];
+    if (!s.haveFader) return;
+    s.fader = stepFaderLaw(s.fader, clicks, fast);
+    s.sendDue = s.needsFinal = true;
+    s.lockedUntil = millis() + LOCK_MS;
+    if (!touched) requestMove();  // the motor follows the knob
+    dirty = true;
+    return;
+  }
+  float v = paramValue(selected, id, idx);
+  if (isnan(v)) return;
+  const ParamInfo &p = PARAMS[id];
+  switch (p.kind) {
+    case 'F': v = stepFaderLaw(v, clicks, fast); break;
+    case 'f': v = constrain(roundf(v * p.steps) + clicks * (fast ? 4 : 1), 0.0f, (float)p.steps) / p.steps; break;
+    case 'i': v = constrain(v + clicks, 0.0f, (float)p.steps); break;
+    case 'b': v = clicks > 0 ? 1.0f : 0.0f; break;
+  }
+  setParam(selected, id, idx, v);
+}
+
+// Encoder press: put the parameter being edited back to its default.
+void resetParam() {
+  uint8_t id = editId, idx = editIdx;
+  if (id == P_NONE || !haveMixer) return;
+  if (id == P_FADER) {
+    Strip &s = strips[selected];
+    if (!s.haveFader) return;
+    s.fader = 0.75f;  // 0 dB
+    s.sendDue = s.needsFinal = true;
+    s.lockedUntil = millis() + LOCK_MS;
+    if (!touched) requestMove();
+    dirty = true;
+    return;
+  }
+  static const float BAND_HZ[4] = {100.0f, 500.0f, 2000.0f, 8000.0f};
+  float v;
+  switch (id) {
+    case P_SEND:       v = 0.75f; break;                                   // 0 dB
+    case P_PAN:        v = 0.5f; break;                                    // centre
+    case P_GAIN:       v = 12.0f / 72.0f; break;                           // 0 dB
+    case P_HPF:        v = log10f(80.0f / 20.0f) / log10f(20.0f); break;  // 80 Hz
+    case P_EQ_TYPE:    v = 2; break;                                       // PEQ
+    case P_EQ_F:       v = log10f(BAND_HZ[idx & 3] / 20.0f) / 3.0f; break;
+    case P_EQ_G:       v = 0.5f; break;                                    // 0 dB
+    case P_EQ_Q:       v = logf(2.0f / 10.0f) / logf(0.03f); break;        // Q 2
+    case P_GATE_THR:   v = 0.0f; break;                                    // -80 dB
+    case P_GATE_RANGE: v = (40.0f - 3.0f) / 57.0f; break;                  // 40 dB
+    case P_GATE_ATT:   v = 0.0f; break;                                    // 0 ms
+    case P_GATE_HOLD:  v = logf(10.0f / 0.02f) / logf(100000.0f); break;   // 10 ms
+    case P_GATE_REL:   v = logf(200.0f / 5.0f) / logf(800.0f); break;      // 200 ms
+    case P_DYN_THR:    v = 1.0f; break;                                    // 0 dB
+    case P_DYN_RATIO:  v = 5; break;                                       // 3:1
+    case P_DYN_KNEE:   v = 0.0f; break;
+    case P_DYN_ATT:    v = 10.0f / 120.0f; break;                          // 10 ms
+    case P_DYN_REL:    v = logf(100.0f / 5.0f) / logf(800.0f); break;     // 100 ms
+    case P_DYN_MGAIN:  v = 0.0f; break;                                    // 0 dB
+    case P_DYN_MIX:    v = 1.0f; break;                                    // 100%
+    default: return;  // on/off settings have no default to return to
+  }
+  const ParamInfo &p = PARAMS[id];
+  if (p.kind == 'f') v = roundf(v * p.steps) / p.steps;
+  setParam(selected, id, idx, v);
+}
+
+void toggleParam(uint8_t id, uint8_t idx) {
+  if (!haveMixer || PARAMS[id].kind != 'b') return;
+  float v = paramValue(selected, id, idx);
+  if (isnan(v)) return;
+  setParam(selected, id, idx, v > 0.5f ? 0.0f : 1.0f);
+}
+
 void handleUiAction(const UiAction &a) {
   if (a.type == UI_SELECT) {
     selectStrip(a.arg);
@@ -919,6 +1199,15 @@ void handleUiAction(const UiAction &a) {
   }
   if (a.type == UI_SCAN) {
     startScan();
+    return;
+  }
+  if (a.type == UI_EDIT) {  // arg = param (P_NONE to stop), arg2 = band/send
+    editId = a.arg;
+    editIdx = a.arg2;
+    return;
+  }
+  if (a.type == UI_TOGGLE) {
+    toggleParam(a.arg, a.arg2);
     return;
   }
   if (!haveMixer) return;
@@ -1130,6 +1419,7 @@ void setup() {
 
   pinMode(ENC_CLK, INPUT_PULLUP);
   pinMode(ENC_DT, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(ENC_CLK), onEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(ENC_DT), onEncoder, CHANGE);
   analogReadResolution(12);
@@ -1201,8 +1491,13 @@ void loop() {
     }
   }
 
-  int clicks = takeClicks();
-  if (clicks) selectStrip(selected + clicks);
+  uint32_t clickGap;
+  int clicks = takeClicks(clickGap);
+  if (clicks) {
+    if (editId != P_NONE && haveMixer) editParam(clicks, clickGap < 40);
+    else selectStrip(selected + clicks);
+  }
+  if (encButtonPressed()) resetParam();
 
   UiAction action;
   while (xQueueReceive(uiQueue, &action, 0) == pdTRUE) handleUiAction(action);

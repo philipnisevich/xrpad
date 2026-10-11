@@ -4,7 +4,9 @@
 // off-screen sprite and pushed only when what it shows has changed.
 //
 // Included from xr_console.ino after the state it reads (strips, details,
-// meters, history), which it copies under stateLock once per frame.
+// meters, network), which it copies under stateLock once per frame. Taps
+// either act directly (toggles, pages) or ask the main loop to point the
+// encoder at a parameter.
 
 #pragma once
 #include <LovyanGFX.hpp>
@@ -175,7 +177,6 @@ struct Snap {
   int sel;
   StripView s[NUM_STRIPS];
   Detail d;
-  int8_t hist[HIST_LEN];
   uint32_t meterSeq;
   bool pickedUp, faderTouched;
   float faderPos;  // where the physical fader is
@@ -197,6 +198,8 @@ struct Snap {
   float detailFrac;
   bool metersLive;
   char mixerName[24], mixerModel[16];
+
+  uint8_t editId, editIdx;  // what the encoder is adjusting
 };
 
 Snap snap;
@@ -216,7 +219,6 @@ void takeSnapshot() {
     v.meter = meterDb[i];
   }
   snap.d = details[selected];
-  for (int x = 0; x < HIST_LEN; x++) snap.hist[x] = hist[selected][(histHead + x) % HIST_LEN];
   snap.meterSeq = meterSeq;
   snap.pickedUp = pickedUp;
   snap.faderTouched = touched && TOUCH_ENABLED;
@@ -251,6 +253,8 @@ void takeSnapshot() {
   snap.metersLive = !isnan(meterDb[0]);
   strlcpy(snap.mixerName, mixerName, sizeof(snap.mixerName));
   strlcpy(snap.mixerModel, mixerModel, sizeof(snap.mixerModel));
+  snap.editId = editId;
+  snap.editIdx = editIdx;
   xSemaphoreGive(stateLock);
 }
 
@@ -273,29 +277,164 @@ struct Hash {
   Hash &str(const char *s) { while (*s) add(*s++); return *this; }
 };
 
-// ---------- layout ----------
+// ---------- layout and touch zones ----------
+
+// Every tappable thing registers a zone while it's drawn, so hitboxes always
+// match what's on screen. Zones are in screen coordinates.
+enum ZoneAct : uint8_t { Z_EDIT, Z_TOGGLE, Z_PAGE, Z_BACK, Z_STRIP, Z_MUTE, Z_SOLO, Z_GEAR, Z_BAND, Z_STOP };
+struct Zone { int16_t x, y, w, h; uint8_t act, id, idx; };
+const int MAX_ZONES = 40;
 
 struct Panel {
   int16_t x, y, w, h;
   LGFX_Sprite spr;
   uint32_t hash;
+  Zone zones[MAX_ZONES];
+  int nz;
 };
 
+// Channel overview
 Panel pHeader  = {0, 0, 480, 52};
 Panel pLevel   = {8, 58, 104, 204};
 Panel pEq      = {118, 58, 236, 124};
-Panel pHistory = {118, 188, 236, 74};
+Panel pDyn     = {118, 188, 236, 74};
 Panel pPreamp  = {360, 58, 112, 124};
 Panel pSends   = {360, 188, 112, 74};
 Panel pStrips  = {0, 268, 480, 52};
-Panel *const PANELS[] = {&pHeader, &pLevel, &pEq, &pHistory, &pPreamp, &pSends, &pStrips};
+// Full pages: a title bar and up to two areas, sized per page
+Panel pPgTitle = {0, 0, 480, 48};
+Panel pPgA     = {0, 48, 480, 220};
+Panel pPgB     = {0, 48, 0, 0};
+Panel *const MAIN_PANELS[] = {&pHeader, &pLevel, &pEq, &pDyn, &pPreamp, &pSends, &pStrips};
+Panel *const PAGE_PANELS[] = {&pPgTitle, &pPgA, &pPgB, &pStrips};
+Panel *const PANELS[] = {&pHeader, &pLevel, &pEq, &pDyn, &pPreamp, &pSends, &pStrips,
+                         &pPgTitle, &pPgA, &pPgB};
 
-const int16_t MUTE_X = 300, SOLO_X = 390, BTN_Y = 8, BTN_W = 82, BTN_H = 36;
-const int16_t GEAR_X = 272, GEAR_Y = 26;  // settings gear in the header
+const int16_t MUTE_X = 248, SOLO_X = 338, BTN_Y = 8, BTN_W = 82, BTN_H = 36;
+const int16_t GEAR_X = 452, GEAR_Y = 26;  // settings gear, far right of the header
 const int16_t STRIP_X0 = 6, STRIP_PITCH = 26;
+
+enum Page : uint8_t { PG_NONE, PG_EQ, PG_GATE, PG_COMP, PG_SENDS, PG_PREAMP };
+Page page = PG_NONE;
+int pageBand = 0;            // EQ page: 0-3 bands, 4 = low cut
 
 int pressedButton = -1;      // 0 mute, 1 solo, for the tap flash
 uint32_t pressedAt = 0;
+
+Panel *zonePanel = nullptr;  // panel being drawn
+
+void beginZones(Panel &p) { p.nz = 0; zonePanel = &p; }
+
+void zone(int x, int y, int w, int h, uint8_t act, uint8_t id = 0, uint8_t idx = 0) {
+  if (!zonePanel || zonePanel->nz >= MAX_ZONES) return;
+  zonePanel->zones[zonePanel->nz++] = {(int16_t)(zonePanel->x + x), (int16_t)(zonePanel->y + y),
+                                       (int16_t)w, (int16_t)h, act, id, idx};
+}
+
+bool editing(uint8_t id, uint8_t idx = 0) { return snap.editId == id && snap.editIdx == idx; }
+
+// ---------- parameter values and text ----------
+
+float gateRangeDb(float x) { return 3.0f + x * 57.0f; }
+float attackMs(float x)    { return x * 120.0f; }
+float holdMs(float x)      { return 0.02f * powf(100000.0f, x); }
+float releaseMs(float x)   { return 5.0f * powf(800.0f, x); }
+float kneeVal(float x)     { return x * 5.0f; }
+float makeupDb(float x)    { return x * 24.0f; }
+float mixPct(float x)      { return x * 100.0f; }
+
+const char *const EQ_TYPES[6] = {"LOW CUT", "LOW SHELF", "PEQ", "VINTAGE", "HIGH SHELF", "HIGH CUT"};
+
+float uiParam(uint8_t id, uint8_t idx) {
+  const Detail &d = snap.d;
+  const StripView &v = snap.s[snap.sel];
+  auto i = [](int8_t x) { return x < 0 ? NAN : (float)x; };
+  switch (id) {
+    case P_FADER:      return v.haveFader ? v.fader : NAN;
+    case P_PAN:        return d.pan;
+    case P_GAIN:       return d.gain;
+    case P_PHANTOM:    return i(d.phantom);
+    case P_INVERT:     return i(d.invert);
+    case P_LR:         return i(d.lr);
+    case P_HPON:       return i(d.hpOn);
+    case P_HPF:        return d.hpf;
+    case P_EQON:       return i(d.eqOn);
+    case P_EQ_TYPE:    return i(d.eq[idx & 3].type);
+    case P_EQ_F:       return d.eq[idx & 3].f;
+    case P_EQ_G:       return d.eq[idx & 3].g;
+    case P_EQ_Q:       return d.eq[idx & 3].q;
+    case P_GATE_ON:    return i(d.gateOn);
+    case P_GATE_THR:   return d.gateThr;
+    case P_GATE_RANGE: return d.gateRange;
+    case P_GATE_ATT:   return d.gateAtt;
+    case P_GATE_HOLD:  return d.gateHold;
+    case P_GATE_REL:   return d.gateRel;
+    case P_DYN_ON:     return i(d.dynOn);
+    case P_DYN_THR:    return d.dynThr;
+    case P_DYN_RATIO:  return i(d.dynRatio);
+    case P_DYN_KNEE:   return d.dynKnee;
+    case P_DYN_ATT:    return d.dynAtt;
+    case P_DYN_REL:    return d.dynRel;
+    case P_DYN_MGAIN:  return d.dynMgain;
+    case P_DYN_MIX:    return d.dynMix;
+    case P_SEND:       return d.sends[idx % 10];
+  }
+  return NAN;
+}
+
+void freqText(char *out, size_t n, float hz) {
+  if (hz < 1000.0f) snprintf(out, n, "%.0f Hz", hz);
+  else if (hz < 10000.0f) snprintf(out, n, "%.2f kHz", hz / 1000.0f);
+  else snprintf(out, n, "%.1f kHz", hz / 1000.0f);
+}
+
+void msText(char *out, size_t n, float ms) {
+  if (ms < 10.0f) snprintf(out, n, "%.1f ms", ms);
+  else if (ms < 1000.0f) snprintf(out, n, "%.0f ms", ms);
+  else snprintf(out, n, "%.2f s", ms / 1000.0f);
+}
+
+void paramText(uint8_t id, uint8_t idx, char *out, size_t n) {
+  float v = uiParam(id, idx);
+  if (isnan(v)) { snprintf(out, n, "--"); return; }
+  switch (id) {
+    case P_FADER: case P_SEND:
+      if (v <= 0.0f) snprintf(out, n, "-inf"); else snprintf(out, n, "%+.1f dB", faderToDb(v));
+      break;
+    case P_PAN: {
+      int p = (int)lroundf(v * 200.0f - 100.0f);
+      if (p == 0) snprintf(out, n, "C"); else snprintf(out, n, "%c%d", p < 0 ? 'L' : 'R', abs(p));
+      break;
+    }
+    case P_GAIN:       snprintf(out, n, "%+.1f dB", preampDb(v)); break;
+    case P_HPF:        freqText(out, n, hpfFreq(v)); break;
+    case P_EQ_TYPE:    snprintf(out, n, "%s", EQ_TYPES[constrain((int)v, 0, 5)]); break;
+    case P_EQ_F:       freqText(out, n, eqFreq(v)); break;
+    case P_EQ_G:       snprintf(out, n, "%+.1f dB", eqGain(v)); break;
+    case P_EQ_Q:       snprintf(out, n, "%.1f", eqQ(v)); break;
+    case P_GATE_THR:   snprintf(out, n, "%.1f dB", gateDb(v)); break;
+    case P_GATE_RANGE: snprintf(out, n, "%.0f dB", gateRangeDb(v)); break;
+    case P_GATE_ATT: case P_DYN_ATT: msText(out, n, attackMs(v)); break;
+    case P_GATE_HOLD:  msText(out, n, holdMs(v)); break;
+    case P_GATE_REL: case P_DYN_REL: msText(out, n, releaseMs(v)); break;
+    case P_DYN_THR:    snprintf(out, n, "%.1f dB", dynDb(v)); break;
+    case P_DYN_RATIO:  snprintf(out, n, "%g:1", RATIOS[constrain((int)v, 0, 11)]); break;
+    case P_DYN_KNEE:   snprintf(out, n, "%.0f", kneeVal(v)); break;
+    case P_DYN_MGAIN:  snprintf(out, n, "%+.1f dB", makeupDb(v)); break;
+    case P_DYN_MIX:    snprintf(out, n, "%.0f%%", mixPct(v)); break;
+    default:           snprintf(out, n, "%s", v > 0.5f ? "ON" : "OFF"); break;
+  }
+}
+
+void paramLabel(uint8_t id, uint8_t idx, char *out, size_t n) {
+  if (id >= P_EQ_TYPE && id <= P_EQ_Q) snprintf(out, n, "EQ %d %s", idx + 1, PARAMS[id].name);
+  else if (id >= P_GATE_THR && id <= P_GATE_REL) snprintf(out, n, "GATE %s", PARAMS[id].name);
+  else if (id >= P_DYN_THR && id <= P_DYN_MIX) snprintf(out, n, "COMP %s", PARAMS[id].name);
+  else if (id == P_SEND) snprintf(out, n, idx < 6 ? "BUS %d SEND" : "FX %d SEND", idx < 6 ? idx + 1 : idx - 5);
+  else snprintf(out, n, "%s", PARAMS[id].name);
+}
+
+// ---------- drawing helpers ----------
 
 // Rounded panel with a small caption in the top-left corner.
 void panelBase(LGFX_Sprite &s, const char *title) {
@@ -307,24 +446,47 @@ void panelBase(LGFX_Sprite &s, const char *title) {
   s.drawString(title, 10, 7);
 }
 
-// Small rounded label; filled when on, outlined when off.
-int pill(LGFX_Sprite &s, int xRight, int y, const char *text, uint16_t color, bool on) {
+// Caption that opens a page, with a little chevron to show it's tappable.
+void pageCaption(LGFX_Sprite &s, const char *title, Page pg, int w = 80) {
   s.setFont(&fonts::DejaVu9);
-  int w = s.textWidth(text) + 10, x = xRight - w;
+  s.setTextDatum(top_left);
+  s.setTextColor(C_DIM);
+  s.drawString(title, 10, 7);
+  int tx = 10 + s.textWidth(title) + 4;
+  s.drawLine(tx, 8, tx + 3, 11, C_DIM);
+  s.drawLine(tx + 3, 11, tx, 14, C_DIM);
+  zone(0, 0, w, 22, Z_PAGE, pg);
+}
+
+void selectedOutline(LGFX_Sprite &s, int x, int y, int w, int h, int r = 6) {
+  s.drawRoundRect(x, y, w, h, r, C_TEAL);
+  s.drawRoundRect(x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : r, C_TEAL);
+}
+
+// Small rounded on/off label that toggles a parameter when tapped.
+int pill(LGFX_Sprite &s, int xRight, int y, const char *text, uint16_t color, bool on,
+         uint8_t toggleId = P_NONE) {
+  s.setFont(&fonts::DejaVu9);
+  int w = s.textWidth(text) + 12, x = xRight - w;
   if (on) {
-    s.fillSmoothRoundRect(x, y, w, 13, 6, color);
+    s.fillSmoothRoundRect(x, y, w, 15, 7, color);
     s.setTextColor(C_BG);
   } else {
-    s.drawRoundRect(x, y, w, 13, 6, C_BORDER);
+    s.drawRoundRect(x, y, w, 15, 7, C_BORDER);
     s.setTextColor(C_FAINT);
   }
   s.setTextDatum(middle_center);
-  s.drawString(text, x + w / 2, y + 7);
+  s.drawString(text, x + w / 2, y + 8);
+  if (toggleId) zone(x - 2, y - 4, w + 4, 23, Z_TOGGLE, toggleId);
   return x - 4;  // where the next pill to the left should end
 }
 
 void dashedHLine(LGFX_Sprite &s, int x0, int x1, int y, uint16_t color) {
   for (int x = x0; x < x1; x += 6) s.drawFastHLine(x, y, min(3, x1 - x), color);
+}
+
+void dashedVLine(LGFX_Sprite &s, int x, int y0, int y1, uint16_t color) {
+  for (int y = y0; y < y1; y += 6) s.drawFastVLine(x, y, min(3, y1 - y), color);
 }
 
 // Arc helper: angles in degrees clockwise from 3 o'clock, a0 < 360 <= a1 allowed.
@@ -349,144 +511,56 @@ void drawGear(G &g, int cx, int cy, uint16_t color, uint16_t bg) {
   g.fillSmoothCircle(cx, cy, 3, bg);
 }
 
-// ---------- panels ----------
+// A labelled value box: tap to edit with the knob, or to toggle.
+void tile(LGFX_Sprite &s, int x, int y, int w, int h, uint8_t id, uint8_t idx = 0) {
+  char label[24], value[20];
+  paramLabel(id, idx, label, sizeof(label));
+  if (id >= P_EQ_TYPE && id <= P_DYN_MIX) {  // drop the "EQ 1 " / "GATE " prefix inside pages
+    const char *sp = strrchr(label, ' ');
+    if (id >= P_EQ_TYPE && id <= P_EQ_Q && sp) memmove(label, sp + 1, strlen(sp));
+    else if ((id >= P_GATE_THR && id <= P_DYN_MIX) && sp) memmove(label, strchr(label, ' ') + 1, strlen(strchr(label, ' ')));
+  }
+  paramText(id, idx, value, sizeof(value));
+  bool toggle = PARAMS[id].kind == 'b';
+  float v = uiParam(id, idx);
+  bool on = toggle && v > 0.5f;
+  bool sel = editing(id, idx);
+  uint16_t accent = id == P_PHANTOM ? C_RED : id == P_INVERT ? C_AMBER : C_TEAL;
 
-void drawHeader(LGFX_Sprite &s) {
-  const StripView &v = snap.s[snap.sel];
-  const Detail &d = snap.d;
-  uint16_t cc = chanColor(v.color);
-  bool flash = millis() - pressedAt < PRESS_FLASH_MS;
-  s.fillScreen(C_BG);
-
-  s.fillSmoothRoundRect(10, 8, 6, 36, 3, cc);
+  s.fillSmoothRoundRect(x, y, w, h, 8, on ? mix565(C_PANEL, accent, 0.35f) : sel ? rgb(26, 44, 48) : C_PANEL);
+  if (sel) selectedOutline(s, x, y, w, h, 8);
+  else s.drawRoundRect(x, y, w, h, 8, on ? accent : C_BORDER);
+  s.setFont(&fonts::DejaVu9);
   s.setTextDatum(top_left);
-  s.setFont(&fonts::DejaVu12);
-  s.setTextColor(C_DIM);
-  s.drawString(v.label, 26, 6);
-  int x = 26 + s.textWidth(v.label) + 10;
-  if (d.lr >= 0) {
-    s.setFont(&fonts::DejaVu9);
-    s.setTextColor(d.lr ? C_DIM : C_AMBER);
-    s.drawString(d.lr ? "LR" : "NOT ON LR", x, 8);
-  }
-
-  const char *name = v.name[0] ? v.name : v.label;
-  s.setFont(&fonts::FreeSansBold18pt7b);
-  if (s.textWidth(name) > GEAR_X - 50) s.setFont(&fonts::FreeSansBold12pt7b);
-  s.setTextColor(C_TEXT);
+  s.setTextColor(sel ? C_TEAL : C_DIM);
+  s.drawString(label, x + 10, y + 8);
+  s.setFont(h >= 56 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold9pt7b);
+  if (s.textWidth(value) > w - 16) s.setFont(&fonts::FreeSansBold9pt7b);
   s.setTextDatum(bottom_left);
-  s.drawString(name, 24, 48);
-
-  drawGear(s, GEAR_X, GEAR_Y, C_DIM, C_BG);
-
-  // Mute
-  bool muted = v.on == 0;
-  uint16_t mFill = muted ? C_RED : C_PANEL;
-  if (flash && pressedButton == 0) mFill = mix565(mFill, C_TEXT, 0.3f);
-  s.fillSmoothRoundRect(MUTE_X, BTN_Y, BTN_W, BTN_H, 8, mFill);
-  if (!muted) s.drawRoundRect(MUTE_X, BTN_Y, BTN_W, BTN_H, 8, C_BORDER);
-  s.setFont(&fonts::FreeSansBold9pt7b);
-  s.setTextDatum(middle_center);
-  s.setTextColor(muted ? C_TEXT : v.on < 0 ? C_FAINT : C_DIM);
-  s.drawString(muted ? "MUTED" : "MUTE", MUTE_X + BTN_W / 2, BTN_Y + BTN_H / 2 + 1);
-
-  // Solo (MAIN has no solo switch)
-  bool soloOk = snap.sel != MAIN_STRIP;
-  bool solo = d.solo == 1;
-  uint16_t sFill = solo ? C_AMBER : C_PANEL;
-  if (flash && pressedButton == 1 && soloOk) sFill = mix565(sFill, C_TEXT, 0.3f);
-  s.fillSmoothRoundRect(SOLO_X, BTN_Y, BTN_W, BTN_H, 8, sFill);
-  if (!solo) s.drawRoundRect(SOLO_X, BTN_Y, BTN_W, BTN_H, 8, C_BORDER);
-  s.setTextColor(solo ? C_BG : soloOk ? C_DIM : C_GRID);
-  s.drawString("SOLO", SOLO_X + BTN_W / 2, BTN_Y + BTN_H / 2 + 1);
+  s.setTextColor(isnan(v) ? C_FAINT : on ? C_TEXT : toggle ? C_DIM : C_TEXT);
+  s.drawString(value, x + 10, y + h - 7);
+  zone(x, y, w, h, toggle ? Z_TOGGLE : Z_EDIT, id, idx);
 }
 
-void drawLevel(LGFX_Sprite &s) {
-  const StripView &v = snap.s[snap.sel];
-  uint16_t cc = chanColor(v.color);
-  panelBase(s, "LEVEL");
-  const int top = 24, bottom = 168, h = bottom - top;
+// ---------- graphs ----------
 
-  // Segmented input meter, -60..0 dBFS
-  const int segs = 36, segH = h / segs;
-  for (int k = 0; k < segs; k++) {
-    float segDb = -60.0f + 60.0f * (k + 1) / segs;
-    uint16_t c = meterColor(segDb);
-    bool lit = !isnan(v.meter) && v.meter >= segDb - 60.0f / segs;
-    int y = bottom - (k + 1) * segH;
-    s.fillRect(10, y + 1, 12, segH - 1, lit ? c : mix565(C_PANEL, c, 0.15f));
-  }
-  s.setFont(&fonts::DejaVu9);
-  s.setTextColor(C_FAINT);
-  s.setTextDatum(top_center);
-  s.drawString("IN", 16, bottom + 3);
-
-  // Fader scale, track and cap
-  static const int MARKS[] = {10, 5, 0, -5, -10, -20, -30, -50};
-  s.setTextDatum(middle_right);
-  for (int db : MARKS) {
-    int y = bottom - (int)lroundf(dbToFader(db) * h);
-    s.drawFastHLine(56, y, 6, db == 0 ? C_GRID0 : C_GRID);
-    s.drawFastHLine(72, y, 6, db == 0 ? C_GRID0 : C_GRID);
-    char t[5];
-    snprintf(t, sizeof(t), db > 0 ? "+%d" : "%d", db);
-    s.setTextColor(db == 0 ? C_DIM : C_FAINT);
-    s.drawString(t, 52, y);
-  }
-  s.drawString("inf", 52, bottom);
-  s.fillSmoothRoundRect(65, top - 2, 4, h + 4, 2, C_GRAPH);
-
-  if (!snap.pickedUp && snap.faderPos >= 0.0f && v.haveFader) {  // where the hand-fader is
-    int gy = bottom - (int)lroundf(snap.faderPos * h);
-    s.drawRoundRect(52, gy - 7, 30, 14, 3, C_FAINT);
-  }
-  if (v.haveFader) {
-    int y = bottom - (int)lroundf(v.fader * h);
-    s.fillSmoothRoundRect(52, y - 7, 30, 14, 3, snap.faderTouched ? C_TEXT : rgb(176, 188, 202));
-    s.fillRect(55, y - 1, 24, 2, cc);
-    if (snap.faderTouched) s.drawRoundRect(51, y - 8, 32, 16, 4, cc);
-  }
-
-  // Readout
-  char t[12];
-  if (v.haveFader) faderText(t, sizeof(t), v.fader);
-  else strcpy(t, "--");
-  s.setFont(&fonts::FreeSansBold12pt7b);
-  s.setTextDatum(middle_center);
-  s.setTextColor(C_TEXT);
-  s.drawString(t, 52, 184);
-  s.setFont(&fonts::DejaVu9);
-  s.setTextColor(C_FAINT);
-  s.drawString("dB", 52, 198);
-}
-
-void drawEq(LGFX_Sprite &s) {
+// EQ response: the four bands (when on) plus the low cut. Handles register
+// zones that select a band (pages) or edit its gain (overview).
+void eqGraph(LGFX_Sprite &s, int gx, int gy, int gw, int gh, bool big) {
   const Detail &d = snap.d;
   uint16_t cc = chanColor(d.color);
-  panelBase(s, "EQ");
-  int right = s.width() - 8;
-  bool eqKnown = d.eqOn >= 0;
-  bool hpKnown = d.hpOn >= 0 && !isnan(d.hpf);
-  if (eqKnown) right = pill(s, right, 5, d.eqOn ? "ON" : "OFF", C_GREEN, d.eqOn);
-  if (hpKnown) {
-    char t[16];
-    snprintf(t, sizeof(t), "LOW CUT %.0f Hz", hpfFreq(d.hpf));
-    pill(s, right, 5, t, C_TEAL, d.hpOn);
-  }
-
-  const int gx = 8, gy = 22, gw = 220, gh = 94;
-  s.fillSmoothRoundRect(gx, gy, gw, gh, 4, C_GRAPH);
+  s.fillSmoothRoundRect(gx, gy, gw, gh, 6, C_GRAPH);
   auto xFor = [&](float hz) { return gx + (int)lroundf(log10f(hz / 20.0f) / 3.0f * (gw - 1)); };
-  auto yFor = [&](float db) { return gy + gh / 2 - (int)lroundf(constrain(db, -15.0f, 15.0f) * (gh / 2 - 3) / 15.0f); };
+  auto yFor = [&](float db) { return gy + gh / 2 - (int)lroundf(constrain(db, -15.0f, 15.0f) * (gh / 2 - 4) / 15.0f); };
 
   static const int MINOR[] = {50, 200, 500, 2000, 5000};
   for (int hz : MINOR) s.drawFastVLine(xFor(hz), gy + 2, gh - 4, C_GRID);
   static const int MAJOR[] = {100, 1000, 10000};
   static const char *const MAJOR_T[] = {"100", "1k", "10k"};
   s.setFont(&fonts::DejaVu9);
-  s.setTextDatum(bottom_center);
   for (int i = 0; i < 3; i++) {
     s.drawFastVLine(xFor(MAJOR[i]), gy + 2, gh - 4, C_BORDER);
+    s.setTextDatum(bottom_center);
     s.setTextColor(C_FAINT);
     s.drawString(MAJOR_T[i], xFor(MAJOR[i]), gy + gh - 2);
   }
@@ -497,19 +571,18 @@ void drawEq(LGFX_Sprite &s) {
   s.drawString("+12", gx + 4, yFor(12));
   s.drawString("-12", gx + 4, yFor(-12));
 
+  bool eqKnown = d.eqOn >= 0, hpKnown = d.hpOn >= 0 && !isnan(d.hpf);
   bool bandsKnown = eqKnown;
   for (const EqBand &b : d.eq)
     if (b.type < 0 || isnan(b.f) || isnan(b.g) || isnan(b.q)) bandsKnown = false;
   if (!bandsKnown && !hpKnown) {
     s.setTextDatum(middle_center);
     s.setTextColor(C_FAINT);
-    s.drawString(eqKnown || snap.sel == MAIN_STRIP ? "" : "reading EQ...", gx + gw / 2, gy + gh / 2 - 12);
+    s.drawString(snap.sel == MAIN_STRIP ? "" : "reading EQ...", gx + gw / 2, gy + gh / 2 - 12);
     return;
   }
 
-  // Response curve: the four bands (when the EQ is on) plus the low cut.
-  bool eqActive = bandsKnown && d.eqOn == 1;
-  bool hpActive = hpKnown && d.hpOn == 1;
+  bool eqActive = bandsKnown && d.eqOn == 1, hpActive = hpKnown && d.hpOn == 1;
   uint16_t lineColor = eqActive || hpActive ? cc : C_FAINT;
   uint16_t fillColor = mix565(C_GRAPH, cc, 0.28f);
   int prevY = zeroY;
@@ -524,74 +597,304 @@ void drawEq(LGFX_Sprite &s) {
       if (y < zeroY) s.drawFastVLine(gx + x, y, zeroY - y, fillColor);
       else if (y > zeroY) s.drawFastVLine(gx + x, zeroY + 1, y - zeroY, fillColor);
     }
-    if (x > 0) s.drawWideLine(gx + x - 1, prevY, gx + x, y, 1.0f, lineColor);
+    if (x > 0) s.drawWideLine(gx + x - 1, prevY, gx + x, y, big ? 1.4f : 1.0f, lineColor);
     prevY = y;
   }
 
-  // Band handles
+  if (big && hpKnown) {  // low cut handle on the page
+    int x = constrain(xFor(hpfFreq(d.hpf)), gx + 9, gx + gw - 10);
+    bool sel = pageBand == 4;
+    s.fillSmoothCircle(x, zeroY, sel ? 10 : 8, d.hpOn == 1 ? C_TEAL : C_FAINT);
+    if (sel) s.drawCircle(x, zeroY, 13, C_TEXT);
+    s.setTextColor(C_BG);
+    s.setTextDatum(middle_center);
+    s.drawString("LC", x, zeroY + 1);
+    zone(x - 14, zeroY - 14, 28, 28, Z_BAND, 0, 4);
+  }
   if (bandsKnown) {
+    int r = big ? 9 : 7;
     for (int i = 0; i < 4; i++) {
       const EqBand &b = d.eq[i];
       bool cut = b.type == 0 || b.type == 5;
-      int x = constrain(xFor(eqFreq(b.f)), gx + 7, gx + gw - 8);
+      int x = constrain(xFor(eqFreq(b.f)), gx + r, gx + gw - r - 1);
       int y = cut ? zeroY : yFor(eqGain(b.g));
+      bool sel = big && pageBand == i;
       uint16_t c = d.eqOn == 1 ? BAND_COLORS[i] : C_FAINT;
-      s.fillSmoothCircle(x, y, 7, c);
+      s.fillSmoothCircle(x, y, sel ? r + 1 : r, c);
+      if (sel) s.drawCircle(x, y, r + 4, C_TEXT);
       s.setTextColor(C_BG);
       s.setTextDatum(middle_center);
       char t[2] = {(char)('1' + i), 0};
       s.drawString(t, x, y + 1);
+      if (big) zone(x - 15, y - 15, 30, 30, Z_BAND, 0, i);
     }
   }
 }
 
-void drawHistory(LGFX_Sprite &s) {
+// Output level against input level for the gate or compressor, with the
+// channel's live input as a dot riding the curve.
+float dynOut(bool comp, float in) {
   const Detail &d = snap.d;
-  uint16_t cc = chanColor(d.color);
-  panelBase(s, "INPUT");
+  if (!comp) {
+    float thr = gateDb(d.gateThr), range = isnan(d.gateRange) ? 40.0f : gateRangeDb(d.gateRange);
+    return in >= thr ? in : in - range;
+  }
+  float thr = dynDb(d.dynThr);
+  float ratio = d.dynRatio >= 0 && d.dynRatio < 12 ? RATIOS[d.dynRatio] : 3.0f;
+  float knee = isnan(d.dynKnee) ? 0.0f : kneeVal(d.dynKnee) * 5.0f;  // knee width in dB
+  float makeup = isnan(d.dynMgain) ? 0.0f : makeupDb(d.dynMgain);
+  float over = in - thr, out;
+  if (knee > 0 && fabsf(over) <= knee / 2) out = in + (1.0f / ratio - 1.0f) * powf(over + knee / 2, 2) / (2 * knee);
+  else if (over > 0) out = thr + over / ratio;
+  else out = in;
+  return out + makeup;
+}
+
+void dynGraph(LGFX_Sprite &s, int gx, int gy, int gw, int gh, bool comp, bool big) {
+  const Detail &d = snap.d;
+  bool known = comp ? !isnan(d.dynThr) : !isnan(d.gateThr);
+  bool on = comp ? d.dynOn == 1 : d.gateOn == 1;
+  uint16_t accent = comp ? C_ORANGE : C_RED;
+  s.fillSmoothRoundRect(gx, gy, gw, gh, big ? 6 : 4, C_GRAPH);
+  const float lo = -60.0f;
+  auto xFor = [&](float db) { return gx + (int)lroundf((constrain(db, lo, 0.0f) - lo) / -lo * (gw - 1)); };
+  auto yFor = [&](float db) { return gy + gh - 1 - (int)lroundf((constrain(db, lo, 0.0f) - lo) / -lo * (gh - 1)); };
+  if (big) {
+    for (int db = -48; db < 0; db += 12) {
+      s.drawFastVLine(xFor(db), gy + 2, gh - 4, C_GRID);
+      s.drawFastHLine(gx + 2, yFor(db), gw - 4, C_GRID);
+    }
+    s.setFont(&fonts::DejaVu9);
+    s.setTextColor(C_FAINT);
+    s.setTextDatum(bottom_left);
+    s.drawString("IN", gx + gw - 20, gy + gh - 3);
+    s.setTextDatum(top_left);
+    s.drawString("OUT", gx + 4, gy + 4);
+  }
+  // 1:1 reference
+  for (int i = 0; i < gw; i += 4) s.drawPixel(gx + i, gy + gh - 1 - i * (gh - 1) / (gw - 1), C_GRID0);
+  if (!known) return;
+
+  float thr = comp ? dynDb(d.dynThr) : gateDb(d.gateThr);
+  if (thr > lo) dashedVLine(s, xFor(thr), gy + 2, gy + gh - 2, on ? accent : C_FAINT);
+  uint16_t curve = on ? accent : C_FAINT;
+  int prevY = 0;
+  for (int x = 0; x < gw; x++) {
+    float in = lo + (float)x / (gw - 1) * -lo;
+    int y = yFor(dynOut(comp, in));  // its shape even when off, just greyed
+    if (x > 0) s.drawWideLine(gx + x - 1, prevY, gx + x, y, big ? 1.5f : 1.0f, curve);
+    prevY = y;
+  }
+  float m = snap.s[snap.sel].meter;
+  if (!isnan(m) && m > lo) {
+    float out = on ? dynOut(comp, m) : m;
+    int x = xFor(m), y = yFor(out);
+    s.fillSmoothCircle(x, y, big ? 6 : 3, mix565(C_GRAPH, C_TEXT, 0.35f));
+    s.fillSmoothCircle(x, y, big ? 4 : 2, C_TEXT);
+  }
+}
+
+// ---------- overview panels ----------
+
+void drawHeader(LGFX_Sprite &s) {
+  const StripView &v = snap.s[snap.sel];
+  const Detail &d = snap.d;
+  uint16_t cc = chanColor(v.color);
+  bool flash = millis() - pressedAt < PRESS_FLASH_MS;
+  s.fillScreen(C_BG);
+
+  s.fillSmoothRoundRect(10, 8, 6, 36, 3, cc);
+  s.setTextDatum(top_left);
+  s.setFont(&fonts::DejaVu9);
+  s.setTextColor(C_DIM);
+  s.drawString(v.label, 24, 4);
+
+  // What the knob is adjusting: a two-line card centred in the space
+  // between the name and the gear. Tap it to stop editing.
+  char label[24] = "", value[20] = "";
+  int cardW = 0;
+  if (snap.editId != P_NONE) {
+    paramLabel(snap.editId, snap.editIdx, label, sizeof(label));
+    paramText(snap.editId, snap.editIdx, value, sizeof(value));
+    s.setFont(&fonts::DejaVu9);
+    int lw = s.textWidth(label);
+    s.setFont(&fonts::FreeSansBold9pt7b);
+    cardW = max(lw, (int)s.textWidth(value)) + 20;
+  }
+  const int spaceEnd = MUTE_X - 10;
+  const char *name = v.name[0] ? v.name : v.label;
+  const lgfx::IFont *fonts[] = {&fonts::FreeSansBold18pt7b, &fonts::FreeSansBold12pt7b, &fonts::FreeSansBold9pt7b};
+  int nameW = 0;
+  for (const lgfx::IFont *f : fonts) {  // biggest font that leaves room for the card
+    s.setFont(f);
+    nameW = s.textWidth(name);
+    if (24 + nameW + (cardW ? cardW + 12 : 0) <= spaceEnd) break;
+  }
+  s.setTextColor(C_TEXT);
+  s.setTextDatum(baseline_left);
+  s.drawString(name, 24, 44);
+
+  if (cardW) {
+    int free0 = 24 + nameW + 8, free1 = spaceEnd;
+    int x = max(free0, (free0 + free1) / 2 - cardW / 2);
+    s.fillSmoothRoundRect(x, 6, cardW, 40, 8, rgb(18, 48, 50));
+    s.drawRoundRect(x, 6, cardW, 40, 8, C_TEAL);
+    s.setFont(&fonts::DejaVu9);
+    s.setTextDatum(top_center);
+    s.setTextColor(C_TEAL);
+    s.drawString(label, x + cardW / 2, 11);
+    s.setFont(&fonts::FreeSansBold9pt7b);
+    s.setTextDatum(bottom_center);
+    s.setTextColor(C_TEXT);
+    s.drawString(value, x + cardW / 2, 42);
+    zone(x - 2, 2, cardW + 4, 48, Z_STOP);
+  }
+
+  drawGear(s, GEAR_X, GEAR_Y, C_DIM, C_BG);
+  zone(GEAR_X - 24, 0, 52, 52, Z_GEAR);
+
+  bool muted = v.on == 0;
+  uint16_t mFill = muted ? C_RED : C_PANEL;
+  if (flash && pressedButton == 0) mFill = mix565(mFill, C_TEXT, 0.3f);
+  s.fillSmoothRoundRect(MUTE_X, BTN_Y, BTN_W, BTN_H, 8, mFill);
+  if (!muted) s.drawRoundRect(MUTE_X, BTN_Y, BTN_W, BTN_H, 8, C_BORDER);
+  s.setFont(&fonts::FreeSansBold9pt7b);
+  s.setTextDatum(middle_center);
+  s.setTextColor(muted ? C_TEXT : v.on < 0 ? C_FAINT : C_DIM);
+  s.drawString(muted ? "MUTED" : "MUTE", MUTE_X + BTN_W / 2, BTN_Y + BTN_H / 2 + 1);
+  zone(MUTE_X - 4, 2, BTN_W + 6, BTN_H + 12, Z_MUTE);
+
+  bool soloOk = snap.sel != MAIN_STRIP, solo = d.solo == 1;
+  uint16_t sFill = solo ? C_AMBER : C_PANEL;
+  if (flash && pressedButton == 1 && soloOk) sFill = mix565(sFill, C_TEXT, 0.3f);
+  s.fillSmoothRoundRect(SOLO_X, BTN_Y, BTN_W, BTN_H, 8, sFill);
+  if (!solo) s.drawRoundRect(SOLO_X, BTN_Y, BTN_W, BTN_H, 8, C_BORDER);
+  s.setTextColor(solo ? C_BG : soloOk ? C_DIM : C_GRID);
+  s.drawString("SOLO", SOLO_X + BTN_W / 2, BTN_Y + BTN_H / 2 + 1);
+  zone(SOLO_X - 2, 2, BTN_W + 6, BTN_H + 12, Z_SOLO);
+}
+
+void drawLevel(LGFX_Sprite &s) {
+  const StripView &v = snap.s[snap.sel];
+  uint16_t cc = chanColor(v.color);
+  panelBase(s, "LEVEL");
+  if (editing(P_FADER)) selectedOutline(s, 0, 0, s.width(), s.height(), 8);
+  const int top = 24, bottom = 168, h = bottom - top;
+
+  // Segmented input meter, -60..0 dBFS
+  const int segs = 36, segH = h / segs;
+  for (int k = 0; k < segs; k++) {
+    float segDb = -60.0f + 60.0f * (k + 1) / segs;
+    uint16_t c = meterColor(segDb);
+    bool lit = !isnan(v.meter) && v.meter >= segDb - 60.0f / segs;
+    s.fillRect(10, bottom - (k + 1) * segH + 1, 12, segH - 1, lit ? c : mix565(C_PANEL, c, 0.15f));
+  }
+
+  static const int MARKS[] = {10, 5, 0, -5, -10, -20, -30, -50};
+  s.setFont(&fonts::DejaVu9);
+  s.setTextDatum(middle_right);
+  for (int db : MARKS) {
+    int y = bottom - (int)lroundf(dbToFader(db) * h);
+    s.drawFastHLine(56, y, 6, db == 0 ? C_GRID0 : C_GRID);
+    s.drawFastHLine(72, y, 6, db == 0 ? C_GRID0 : C_GRID);
+    char t[5];
+    snprintf(t, sizeof(t), db > 0 ? "+%d" : "%d", db);
+    s.setTextColor(db == 0 ? C_DIM : C_FAINT);
+    s.drawString(t, 52, y);
+  }
+  s.drawString("inf", 52, bottom);
+  s.fillSmoothRoundRect(65, top - 2, 4, h + 4, 2, C_GRAPH);
+
+  if (!snap.pickedUp && snap.faderPos >= 0.0f && v.haveFader) {
+    int gy = bottom - (int)lroundf(snap.faderPos * h);
+    s.drawRoundRect(52, gy - 7, 30, 14, 3, C_FAINT);
+  }
+  if (v.haveFader) {
+    int y = bottom - (int)lroundf(v.fader * h);
+    s.fillSmoothRoundRect(52, y - 7, 30, 14, 3, snap.faderTouched ? C_TEXT : rgb(176, 188, 202));
+    s.fillRect(55, y - 1, 24, 2, cc);
+    if (snap.faderTouched) s.drawRoundRect(51, y - 8, 32, 16, 4, cc);
+  }
+
+  char t[12];
+  if (v.haveFader) faderText(t, sizeof(t), v.fader);
+  else strcpy(t, "--");
+  s.setFont(&fonts::FreeSansBold12pt7b);
+  s.setTextDatum(middle_center);
+  s.setTextColor(editing(P_FADER) ? C_TEAL : C_TEXT);
+  s.drawString(t, 52, 184);
+  s.setFont(&fonts::DejaVu9);
+  s.setTextColor(C_FAINT);
+  s.drawString("dB", 52, 198);
+  zone(0, 0, s.width(), s.height(), Z_EDIT, P_FADER);
+}
+
+void drawEqPanel(LGFX_Sprite &s) {
+  const Detail &d = snap.d;
+  s.fillScreen(C_BG);
+  s.fillSmoothRoundRect(0, 0, s.width(), s.height(), 8, C_PANEL);
+  pageCaption(s, "EQ", PG_EQ);
   int right = s.width() - 8;
+  if (d.eqOn >= 0) right = pill(s, right, 4, d.eqOn ? "ON" : "OFF", C_GREEN, d.eqOn, P_EQON);
+  if (d.hpOn >= 0) pill(s, right, 4, "LOW CUT", C_TEAL, d.hpOn, P_HPON);
+  zone(0, 22, s.width(), s.height() - 22, Z_PAGE, PG_EQ);  // anywhere else opens the page
+  eqGraph(s, 8, 24, s.width() - 16, s.height() - 30, false);
+}
+
+void dynHalf(LGFX_Sprite &s, int x0, bool comp) {
+  const Detail &d = snap.d;
+  int8_t on = comp ? d.dynOn : d.gateOn;
+  uint16_t accent = comp ? C_ORANGE : C_RED;
+  const int w = 118;
+  // caption + toggle
+  s.setFont(&fonts::DejaVu9);
+  s.setTextDatum(top_left);
+  s.setTextColor(C_DIM);
+  const char *title = comp ? "COMP" : "GATE";
+  s.drawString(title, x0 + 10, 7);
+  int tx = x0 + 10 + s.textWidth(title) + 4;
+  s.drawLine(tx, 8, tx + 3, 11, C_DIM);
+  s.drawLine(tx + 3, 11, tx, 14, C_DIM);
+  zone(x0, 0, w, s.height(), Z_PAGE, comp ? PG_COMP : PG_GATE);
+  if (on >= 0) pill(s, x0 + w - 6, 4, on ? "ON" : "OFF", accent, on == 1, comp ? P_DYN_ON : P_GATE_ON);
+
+  uint8_t thrId = comp ? P_DYN_THR : P_GATE_THR;
+  dynGraph(s, x0 + 8, 24, 44, 44, comp, false);
+
   char t[20];
-  if (d.dynOn >= 0 && !isnan(d.dynThr)) {
-    if (d.dynRatio >= 0 && d.dynRatio < 12)
-      snprintf(t, sizeof(t), "COMP %.0f  %g:1", dynDb(d.dynThr), RATIOS[d.dynRatio]);
-    else
-      snprintf(t, sizeof(t), "COMP %.0f", dynDb(d.dynThr));
-    right = pill(s, right, 5, t, C_ORANGE, d.dynOn == 1);
-  }
-  if (d.gateOn >= 0 && !isnan(d.gateThr)) {
-    snprintf(t, sizeof(t), "GATE %.0f", gateDb(d.gateThr));
-    pill(s, right, 5, t, C_TEAL, d.gateOn == 1);
-  }
+  s.setFont(&fonts::DejaVu9);
+  s.setTextDatum(top_left);
+  s.setTextColor(C_FAINT);
+  s.drawString("THR", x0 + 60, 26);
+  paramText(thrId, 0, t, sizeof(t));
+  s.setTextColor(C_TEXT);
+  s.setFont(&fonts::DejaVu12);
+  s.drawString(t, x0 + 60, 37);
+  s.setFont(&fonts::DejaVu9);
+  s.setTextColor(C_FAINT);
+  s.drawString(comp ? "RATIO" : "RANGE", x0 + 60, 52);
+  paramText(comp ? P_DYN_RATIO : P_GATE_RANGE, 0, t, sizeof(t));
+  s.setTextColor(C_DIM);
+  s.drawString(t, x0 + 60, 62);
+}
 
-  const int gx = 8, gy = 22, gw = 220, gh = 46;
-  s.fillSmoothRoundRect(gx, gy, gw, gh, 4, C_GRAPH);
-  auto yFor = [&](float db) { return gy + gh - 1 - (int)lroundf((constrain(db, -60.0f, 0.0f) + 60.0f) / 60.0f * (gh - 2)); };
-  for (int db : {-12, -24, -36, -48}) s.drawFastHLine(gx + 2, yFor(db), gw - 4, C_GRID);
-
-  for (int x = 0; x < gw && x < HIST_LEN; x++) {
-    int8_t v = snap.hist[x];
-    if (v <= -60) continue;
-    int y = yFor(v), bottom = gy + gh - 1;
-    uint16_t c = meterColor(v);
-    s.drawFastVLine(gx + x, y, bottom - y, mix565(C_GRAPH, c, 0.35f));
-    s.drawFastVLine(gx + x, y, 2, c);
-  }
-
-  // Thresholds: where the gate opens and the compressor starts working.
-  if (!isnan(d.gateThr) && gateDb(d.gateThr) > -60.0f)
-    dashedHLine(s, gx + 2, gx + gw - 2, yFor(gateDb(d.gateThr)), d.gateOn == 1 ? C_TEAL : C_FAINT);
-  if (!isnan(d.dynThr))
-    dashedHLine(s, gx + 2, gx + gw - 2, yFor(dynDb(d.dynThr)), d.dynOn == 1 ? C_ORANGE : C_FAINT);
-  (void)cc;
+void drawDynPanel(LGFX_Sprite &s) {
+  s.fillScreen(C_BG);
+  s.fillSmoothRoundRect(0, 0, s.width(), s.height(), 8, C_PANEL);
+  dynHalf(s, 0, false);
+  s.drawFastVLine(118, 8, s.height() - 16, C_BORDER);
+  dynHalf(s, 118, true);
 }
 
 void drawPreamp(LGFX_Sprite &s) {
   const Detail &d = snap.d;
   uint16_t cc = chanColor(d.color);
-  panelBase(s, "PREAMP");
+  s.fillScreen(C_BG);
+  s.fillSmoothRoundRect(0, 0, s.width(), s.height(), 8, C_PANEL);
+  pageCaption(s, "PREAMP", PG_PREAMP, 70);
 
-  // Gain dial, -12..+60 dB over 270 degrees
   const int cx = 36, cy = 58;
+  if (editing(P_GAIN)) s.drawCircle(cx, cy, 31, C_TEAL), s.drawCircle(cx, cy, 32, C_TEAL);
   arc(s, cx, cy, 21, 27, 135.0f, 405.0f, C_GRAPH);
   s.setTextDatum(middle_center);
   if (!isnan(d.gain)) {
@@ -599,80 +902,78 @@ void drawPreamp(LGFX_Sprite &s) {
     char t[8];
     snprintf(t, sizeof(t), "%+.0f", preampDb(d.gain));
     s.setFont(&fonts::FreeSansBold9pt7b);
-    s.setTextColor(C_TEXT);
+    s.setTextColor(editing(P_GAIN) ? C_TEAL : C_TEXT);
     s.drawString(t, cx, cy - 1);
     s.setFont(&fonts::DejaVu9);
     s.setTextColor(C_FAINT);
     s.drawString("dB", cx, cy + 13);
+    zone(cx - 32, cy - 32, 64, 64, Z_EDIT, P_GAIN);
   } else {
     s.setFont(&fonts::DejaVu9);
     s.setTextColor(C_FAINT);
     s.drawString(snap.sel == MAIN_STRIP ? "n/a" : "--", cx, cy);
   }
 
-  // Badges
-  auto badge = [&](int y, const char *text, int8_t state, uint16_t color) {
+  auto badge = [&](int y, const char *text, int8_t state, uint16_t color, uint8_t id) {
     if (state < 0) return;
-    if (state) s.fillSmoothRoundRect(70, y, 34, 16, 4, color);
-    else s.drawRoundRect(70, y, 34, 16, 4, C_BORDER);
+    if (state) s.fillSmoothRoundRect(70, y, 34, 17, 4, color);
+    else s.drawRoundRect(70, y, 34, 17, 4, C_BORDER);
     s.setFont(&fonts::DejaVu9);
     s.setTextColor(state ? C_BG : C_FAINT);
     s.setTextDatum(middle_center);
-    s.drawString(text, 87, y + 8);
+    s.drawString(text, 87, y + 9);
+    zone(66, y - 2, 44, 21, Z_TOGGLE, id);
   };
-  badge(26, "48V", d.phantom, C_RED);
-  badge(46, "INV", d.invert, C_AMBER);
-  badge(66, "LR", d.lr, rgb(96, 165, 250));
+  badge(24, "48V", d.phantom, C_RED, P_PHANTOM);
+  badge(45, "INV", d.invert, C_AMBER, P_INVERT);
+  badge(66, "LR", d.lr, rgb(96, 165, 250), P_LR);
 
-  // Pan
   s.setFont(&fonts::DejaVu9);
   s.setTextDatum(middle_left);
-  s.setTextColor(C_DIM);
+  s.setTextColor(editing(P_PAN) ? C_TEAL : C_DIM);
   s.drawString("PAN", 10, 98);
   if (!isnan(d.pan)) {
-    int p = (int)lroundf(d.pan * 200.0f - 100.0f);
     char t[8];
-    if (p == 0) strcpy(t, "C");
-    else snprintf(t, sizeof(t), "%c%d", p < 0 ? 'L' : 'R', abs(p));
+    paramText(P_PAN, 0, t, sizeof(t));
     s.setTextDatum(middle_right);
     s.setTextColor(C_TEXT);
     s.drawString(t, 102, 98);
   }
   const int bx = 10, bw = 92, by = 110;
+  if (editing(P_PAN)) selectedOutline(s, 4, 90, 104, 30, 6);
   s.fillSmoothRoundRect(bx, by, bw, 5, 2, C_GRAPH);
   s.drawFastVLine(bx + bw / 2, by - 3, 11, C_GRID0);
   if (!isnan(d.pan)) {
-    int px = bx + (int)lroundf(d.pan * bw);
-    int mid = bx + bw / 2;
+    int px = bx + (int)lroundf(d.pan * bw), mid = bx + bw / 2;
     s.fillRect(min(px, mid), by + 1, abs(px - mid), 3, cc);
     s.fillSmoothCircle(px, by + 2, 5, C_TEXT);
   }
+  zone(2, 88, 108, 34, Z_EDIT, P_PAN);
 }
 
 void drawSends(LGFX_Sprite &s) {
   const Detail &d = snap.d;
-  panelBase(s, "SENDS");
-  s.setFont(&fonts::DejaVu9);
-  s.setTextDatum(top_right);
-  s.setTextColor(C_FAINT);
-  s.drawString("BUS / FX", s.width() - 10, 7);
-
+  s.fillScreen(C_BG);
+  s.fillSmoothRoundRect(0, 0, s.width(), s.height(), 8, C_PANEL);
+  pageCaption(s, "SENDS", PG_SENDS, 70);
   const int top = 22, h = 34, bw = 6;
   for (int k = 0; k < 10; k++) {
     bool fx = k >= 6;
     int x = 10 + k * 9 + (fx ? 6 : 0);
     s.fillSmoothRoundRect(x, top, bw, h, 2, C_GRAPH);
-    s.drawFastHLine(x - 1, top + h - (int)lroundf(0.75f * h), bw + 2, C_GRID0);  // 0 dB
+    s.drawFastHLine(x - 1, top + h - (int)lroundf(0.75f * h), bw + 2, C_GRID0);
     if (!isnan(d.sends[k])) {
       int fh = (int)lroundf(constrain(d.sends[k], 0.0f, 1.0f) * h);
       if (fh > 0) s.fillSmoothRoundRect(x, top + h - fh, bw, fh, 2, fx ? C_PURPLE : C_TEAL);
     }
     char t[3];
     snprintf(t, sizeof(t), "%d", fx ? k - 5 : k + 1);
+    s.setFont(&fonts::DejaVu9);
     s.setTextDatum(top_center);
     s.setTextColor(C_FAINT);
     s.drawString(t, x + bw / 2, top + h + 4);
   }
+  zone(0, 0, s.width(), s.height(), Z_PAGE, PG_SENDS);
 }
 
 void drawStrips(LGFX_Sprite &s) {
@@ -688,7 +989,6 @@ void drawStrips(LGFX_Sprite &s) {
       s.drawRoundRect(x, top, w, h, 5, cc);
       s.drawRoundRect(x + 1, top + 1, w - 2, h - 2, 4, cc);
     }
-
     char t[4];
     if (i < 16) snprintf(t, sizeof(t), "%d", i + 1);
     else strcpy(t, i == AUX_STRIP ? "AX" : "LR");
@@ -698,7 +998,6 @@ void drawStrips(LGFX_Sprite &s) {
     s.drawString(t, x + w / 2, top + 4);
     s.fillRect(x + 5, top + 15, w - 10, 2, cc);
 
-    // meter (left) and fader (right)
     const int mTop = top + 20, mH = h - 25;
     s.fillRect(x + 5, mTop, 4, mH, C_GRAPH);
     if (!isnan(v.meter) && v.meter > -60.0f) {
@@ -710,12 +1009,240 @@ void drawStrips(LGFX_Sprite &s) {
       int fy = mTop + mH - (int)lroundf(v.fader * mH);
       s.fillRect(x + 12, fy - 1, 8, 3, sel ? C_TEXT : rgb(160, 172, 188));
     }
+    zone(x - 1, 0, STRIP_PITCH, 52, Z_STRIP, 0, i);
+  }
+}
+
+// ---------- full pages ----------
+
+const char *const PAGE_TITLES[] = {"", "EQ", "GATE", "COMPRESSOR", "SENDS", "PREAMP"};
+
+void setPanelGeometry(Panel &p, int x, int y, int w, int h) {
+  p.x = x; p.y = y;
+  if (p.w != w || p.h != h || (w && !p.spr.getBuffer())) {
+    p.w = w; p.h = h;
+    p.spr.deleteSprite();
+    if (w && h) p.spr.createSprite(w, h);
+  }
+  p.hash = 0;
+  p.nz = 0;
+}
+
+// Splits the page area (y 48-268) into A (graph/dial) and B (controls).
+void layoutPage(Page pg) {
+  switch (pg) {
+    case PG_EQ:     setPanelGeometry(pPgA, 0, 48, 320, 220); setPanelGeometry(pPgB, 320, 48, 160, 220); break;
+    case PG_GATE:
+    case PG_COMP:   setPanelGeometry(pPgA, 0, 48, 236, 220); setPanelGeometry(pPgB, 236, 48, 244, 220); break;
+    case PG_SENDS:  setPanelGeometry(pPgA, 0, 48, 480, 220); setPanelGeometry(pPgB, 0, 48, 0, 0); break;
+    case PG_PREAMP: setPanelGeometry(pPgA, 0, 48, 224, 220); setPanelGeometry(pPgB, 224, 48, 256, 220); break;
+    default: break;
+  }
+  pPgTitle.hash = 0;
+}
+
+void drawPageTitle(LGFX_Sprite &s) {
+  const StripView &v = snap.s[snap.sel];
+  s.fillScreen(C_BG);
+  // back
+  s.fillSmoothRoundRect(8, 7, 96, 34, 8, C_PANEL);
+  s.drawRoundRect(8, 7, 96, 34, 8, C_BORDER);
+  s.drawWideLine(22, 24, 29, 17, 1.6f, C_TEXT);
+  s.drawWideLine(22, 24, 29, 31, 1.6f, C_TEXT);
+  s.setFont(&fonts::FreeSansBold9pt7b);
+  s.setTextDatum(middle_center);
+  s.setTextColor(C_TEXT);
+  s.drawString("BACK", 66, 25);
+  zone(0, 0, 110, 48, Z_BACK);
+
+  s.fillSmoothRoundRect(114, 10, 5, 28, 2, chanColor(v.color));
+  s.setFont(&fonts::FreeSansBold12pt7b);
+  s.setTextDatum(middle_left);
+  s.drawString(PAGE_TITLES[page], 128, 25);
+  int x = 128 + s.textWidth(PAGE_TITLES[page]) + 12;
+  s.setFont(&fonts::DejaVu12);
+  s.setTextColor(C_DIM);
+  char t[32];
+  snprintf(t, sizeof(t), "%s  %s", v.label, v.name);
+  s.drawString(t, x, 26);
+
+  uint8_t onId = page == PG_EQ ? P_EQON : page == PG_GATE ? P_GATE_ON : page == PG_COMP ? P_DYN_ON : P_NONE;
+  if (onId) {
+    float on = uiParam(onId, 0);
+    if (!isnan(on)) {
+      uint16_t accent = page == PG_COMP ? C_ORANGE : page == PG_GATE ? C_RED : C_GREEN;
+      bool o = on > 0.5f;
+      s.fillSmoothRoundRect(388, 7, 84, 34, 8, o ? accent : C_PANEL);
+      if (!o) s.drawRoundRect(388, 7, 84, 34, 8, C_BORDER);
+      s.setFont(&fonts::FreeSansBold9pt7b);
+      s.setTextDatum(middle_center);
+      s.setTextColor(o ? C_BG : C_DIM);
+      s.drawString(o ? "ON" : "OFF", 430, 25);
+      zone(384, 0, 96, 48, Z_TOGGLE, onId);
+    }
+  }
+}
+
+// EQ: big curve and band buttons (A), the selected band's settings (B).
+void drawEqPageA(LGFX_Sprite &s) {
+  s.fillScreen(C_BG);
+  eqGraph(s, 8, 4, 304, 158, true);
+  static const char *const LABELS[] = {"1", "2", "3", "4", "LOW CUT"};
+  const int bx[5] = {8, 58, 108, 158, 216}, bw[5] = {44, 44, 44, 44, 96};
+  for (int i = 0; i < 5; i++) {
+    bool sel = pageBand == i;
+    uint16_t c = i < 4 ? BAND_COLORS[i] : C_TEAL;
+    s.fillSmoothRoundRect(bx[i], 170, bw[i], 44, 8, sel ? c : C_PANEL);
+    if (!sel) s.drawRoundRect(bx[i], 170, bw[i], 44, 8, C_BORDER);
+    s.setFont(i < 4 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold9pt7b);
+    s.setTextDatum(middle_center);
+    s.setTextColor(sel ? C_BG : c);
+    s.drawString(LABELS[i], bx[i] + bw[i] / 2, 193);
+    zone(bx[i] - 2, 166, bw[i] + 4, 52, Z_BAND, 0, i);
+  }
+}
+
+void drawEqPageB(LGFX_Sprite &s) {
+  s.fillScreen(C_BG);
+  if (pageBand == 4) {
+    tile(s, 0, 4, 152, 64, P_HPON);
+    tile(s, 0, 74, 152, 64, P_HPF);
+  } else {
+    tile(s, 0, 4, 152, 49, P_EQ_TYPE, pageBand);
+    tile(s, 0, 57, 152, 49, P_EQ_F, pageBand);
+    tile(s, 0, 110, 152, 49, P_EQ_G, pageBand);
+    tile(s, 0, 163, 152, 51, P_EQ_Q, pageBand);
+  }
+}
+
+void drawDynPageA(LGFX_Sprite &s) {
+  bool comp = page == PG_COMP;
+  s.fillScreen(C_BG);
+  dynGraph(s, 8, 4, 220, 210, comp, true);
+  zone(8, 4, 220, 210, Z_EDIT, comp ? P_DYN_THR : P_GATE_THR);
+}
+
+void drawDynPageB(LGFX_Sprite &s) {
+  s.fillScreen(C_BG);
+  if (page == PG_GATE) {
+    static const uint8_t IDS[] = {P_GATE_THR, P_GATE_RANGE, P_GATE_ATT, P_GATE_HOLD, P_GATE_REL};
+    for (int i = 0; i < 5; i++) tile(s, (i % 2) * 120, 4 + (i / 2) * 72, 116, 66, IDS[i]);
+  } else {
+    static const uint8_t IDS[] = {P_DYN_THR, P_DYN_RATIO, P_DYN_KNEE, P_DYN_MGAIN,
+                                  P_DYN_ATT, P_DYN_REL, P_DYN_MIX};
+    for (int i = 0; i < 7; i++) tile(s, (i % 2) * 120, 4 + (i / 2) * 53, 116, 49, IDS[i]);
+  }
+  // Live level readout in the spare slot
+  float m = snap.s[snap.sel].meter;
+  int x = 120, y = page == PG_GATE ? 148 : 163, h = page == PG_GATE ? 66 : 49;
+  s.fillSmoothRoundRect(x, y, 116, h, 8, C_GRAPH);
+  s.setFont(&fonts::DejaVu9);
+  s.setTextDatum(top_left);
+  s.setTextColor(C_DIM);
+  s.drawString(page == PG_GATE ? "INPUT" : "REDUCTION", x + 10, y + 8);
+  char t[16];
+  if (isnan(m) || m <= -60.0f) strcpy(t, "--");
+  else if (page == PG_GATE) snprintf(t, sizeof(t), "%.0f dB", m);
+  else {
+    float gr = (snap.d.dynOn == 1 ? dynOut(true, m) - (isnan(snap.d.dynMgain) ? 0 : makeupDb(snap.d.dynMgain)) : m) - m;
+    snprintf(t, sizeof(t), "%.1f dB", gr);
+  }
+  s.setFont(h >= 56 ? &fonts::FreeSansBold12pt7b : &fonts::FreeSansBold9pt7b);
+  s.setTextDatum(bottom_left);
+  s.setTextColor(C_TEXT);
+  s.drawString(t, x + 10, y + h - 7);
+}
+
+void drawSendsPage(LGFX_Sprite &s) {
+  const Detail &d = snap.d;
+  s.fillScreen(C_BG);
+  const int top = 26, h = 150, w = 40, pitch = 46, x0 = 12;
+  for (int k = 0; k < 10; k++) {
+    bool fx = k >= 6, sel = editing(P_SEND, k);
+    int x = x0 + k * pitch + (fx ? 4 : 0);
+    uint16_t accent = fx ? C_PURPLE : C_TEAL;
+    s.fillSmoothRoundRect(x, 0, w, 214, 8, sel ? rgb(26, 44, 48) : C_PANEL);
+    if (sel) selectedOutline(s, x, 0, w, 214, 8);
+    char t[8];
+    snprintf(t, sizeof(t), fx ? "FX %d" : "BUS %d", fx ? k - 5 : k + 1);
+    s.setFont(&fonts::DejaVu9);
+    s.setTextDatum(top_center);
+    s.setTextColor(sel ? C_TEAL : C_DIM);
+    s.drawString(t, x + w / 2, 8);
+    int cx = x + w / 2;
+    s.fillSmoothRoundRect(cx - 3, top, 6, h, 3, C_GRAPH);
+    int unity = top + h - (int)lroundf(0.75f * h);
+    s.drawFastHLine(cx - 10, unity, 20, C_GRID0);
+    float v = d.sends[k];
+    if (!isnan(v)) {
+      int fh = (int)lroundf(constrain(v, 0.0f, 1.0f) * h);
+      if (fh > 0) s.fillSmoothRoundRect(cx - 3, top + h - fh, 6, fh, 3, accent);
+      int y = top + h - fh;
+      s.fillSmoothRoundRect(cx - 13, y - 6, 26, 12, 3, sel ? C_TEXT : rgb(176, 188, 202));
+      s.fillRect(cx - 9, y - 1, 18, 2, accent);
+    }
+    paramText(P_SEND, k, t, sizeof(t));
+    if (strstr(t, " dB")) *strstr(t, " dB") = 0;
+    s.setFont(&fonts::DejaVu12);
+    s.setTextDatum(middle_center);
+    s.setTextColor(sel ? C_TEXT : C_DIM);
+    s.drawString(t, cx, 196);
+    zone(x - 2, 0, w + 4, 214, Z_EDIT, P_SEND, k);
+  }
+}
+
+void drawPreampPageA(LGFX_Sprite &s) {
+  const Detail &d = snap.d;
+  uint16_t cc = chanColor(d.color);
+  s.fillScreen(C_BG);
+  s.fillSmoothRoundRect(8, 0, 208, 214, 10, editing(P_GAIN) ? rgb(26, 44, 48) : C_PANEL);
+  if (editing(P_GAIN)) selectedOutline(s, 8, 0, 208, 214, 10);
+  const int cx = 112, cy = 104;
+  arc(s, cx, cy, 62, 76, 135.0f, 405.0f, C_GRAPH);
+  s.setFont(&fonts::DejaVu9);
+  s.setTextDatum(top_left);
+  s.setTextColor(editing(P_GAIN) ? C_TEAL : C_DIM);
+  s.drawString("GAIN", 20, 10);
+  if (!isnan(d.gain)) {
+    arc(s, cx, cy, 62, 76, 135.0f, 135.0f + 270.0f * constrain(d.gain, 0.0f, 1.0f), cc);
+    char t[12];
+    snprintf(t, sizeof(t), "%+.1f", preampDb(d.gain));
+    s.setFont(&fonts::FreeSansBold18pt7b);
+    s.setTextDatum(middle_center);
+    s.setTextColor(C_TEXT);
+    s.drawString(t, cx, cy - 2);
+    s.setFont(&fonts::DejaVu12);
+    s.setTextColor(C_FAINT);
+    s.drawString("dB", cx, cy + 26);
+    s.setFont(&fonts::DejaVu9);
+    s.drawString("-12", cx - 52, cy + 66);
+    s.drawString("+60", cx + 52, cy + 66);
+    zone(8, 0, 208, 214, Z_EDIT, P_GAIN);
+  } else {
+    s.setFont(&fonts::DejaVu12);
+    s.setTextDatum(middle_center);
+    s.setTextColor(C_FAINT);
+    s.drawString(snap.sel == MAIN_STRIP ? "no preamp" : "--", cx, cy);
+  }
+}
+
+void drawPreampPageB(LGFX_Sprite &s) {
+  s.fillScreen(C_BG);
+  static const uint8_t IDS[] = {P_PHANTOM, P_INVERT, P_HPON, P_HPF, P_LR, P_PAN};
+  for (int i = 0; i < 6; i++) tile(s, (i % 2) * 124, 4 + (i / 2) * 72, 120, 66, IDS[i]);
+  // pan position bar inside its tile
+  float pan = uiParam(P_PAN, 0);
+  if (!isnan(pan)) {
+    int bx = 124 + 64, bw = 46, by = 4 + 2 * 72 + 26;
+    s.fillSmoothRoundRect(bx, by, bw, 4, 2, C_GRAPH);
+    s.drawFastVLine(bx + bw / 2, by - 3, 10, C_GRID0);
+    s.fillSmoothCircle(bx + (int)lroundf(pan * bw), by + 2, 4, C_TEXT);
   }
 }
 
 // ---------- screens ----------
 
-enum View { V_STATUS, V_MAIN, V_PICKER, V_KEYBOARD, V_SETTINGS, V_SYNC };
+enum View { V_STATUS, V_MAIN, V_PICKER, V_KEYBOARD, V_SETTINGS, V_SYNC, V_PAGE };
 enum Screen { SCR_AUTO, SCR_PICKER, SCR_KEYBOARD, SCR_SETTINGS };  // where the user navigated
 Screen screen = SCR_AUTO;
 View view = V_STATUS;
@@ -732,8 +1259,8 @@ void joinFromUi(const char *ssid, const char *pass, bool useSaved) {
   screen = SCR_AUTO;
 }
 
-void sendAction(UiActionType type, int arg = 0) {
-  UiAction a = {type, (int8_t)arg};
+void sendAction(UiActionType type, int arg = 0, int arg2 = 0) {
+  UiAction a = {type, (int8_t)arg, (uint8_t)arg2};
   xQueueSend(uiQueue, &a, 0);
 }
 
@@ -917,7 +1444,7 @@ View pickView() {
     return V_STATUS;
   }
   if (syncing()) return V_SYNC;
-  return V_MAIN;
+  return page != PG_NONE ? V_PAGE : V_MAIN;
 }
 
 // Rounded button; `accent` fills it.
@@ -1200,6 +1727,7 @@ void drawSettings() {
   tft.setTextColor(C_TEXT);
   tft.drawString("Settings", 16, 28);
   button(376, 10, 94, 36, "CLOSE");
+  tft.setTextDatum(middle_left);  // button() leaves it centred
 
   tft.fillSmoothRoundRect(12, 58, 456, 108, 10, C_PANEL);
   tft.setFont(&fonts::DejaVu9);
@@ -1242,27 +1770,69 @@ const bool SHOW_TAPS = false;  // draw a dot where each tap registered (for chec
 int16_t tapX = -1, tapY = -1;
 uint32_t tapAt = 0;
 
-void mainTap(int x, int y, const char *&what) {
-  const int pad = 6;  // forgiving edges around buttons
-  if (inside(x, y, GEAR_X - 22, 0, 44, 52, 0)) {
-    screen = SCR_SETTINGS;
-    what = "settings";
-  } else if (y >= BTN_Y - pad && y < BTN_Y + BTN_H + pad && x >= MUTE_X - pad && x < MUTE_X + BTN_W + pad / 2) {
-    sendAction(UI_MUTE);
-    pressedButton = 0;
-    pressedAt = millis();
-    what = "MUTE";
-  } else if (y >= BTN_Y - pad && y < BTN_Y + BTN_H + pad && x >= SOLO_X - pad / 2 && x < SOLO_X + BTN_W + pad) {
-    sendAction(UI_SOLO);
-    pressedButton = 1;
-    pressedAt = millis();
-    what = "SOLO";
-  } else if (y >= pStrips.y - pad) {
-    // Nearest strip centre, so taps in the gaps still land somewhere sensible.
-    int i = (int)lroundf((float)(x - STRIP_X0 - 12) / STRIP_PITCH);
-    i = constrain(i, 0, NUM_STRIPS - 1);
-    sendAction(UI_SELECT, i);
-    what = snap.s[i].label;
+void openPage(Page pg) {
+  page = pg;
+  if (pg == PG_EQ && snap.editId >= P_EQ_TYPE && snap.editId <= P_EQ_Q) pageBand = snap.editIdx & 3;
+  else if (pg == PG_EQ && snap.editId == P_HPF) pageBand = 4;
+}
+
+// Taps on the overview and pages: the smallest zone under the finger wins.
+void zoneTap(int x, int y, const char *&what) {
+  Panel *const *list = view == V_PAGE ? PAGE_PANELS : MAIN_PANELS;
+  int count = view == V_PAGE ? 4 : 7;
+  const Zone *best = nullptr;
+  int bestArea = INT32_MAX;
+  for (int p = 0; p < count; p++) {
+    const Panel &pn = *list[p];
+    if (!pn.w) continue;
+    for (int i = 0; i < pn.nz; i++) {
+      const Zone &z = pn.zones[i];
+      if (!inside(x, y, z.x, z.y, z.w, z.h, 3)) continue;
+      int area = z.w * z.h;
+      if (area < bestArea) { best = &z; bestArea = area; }
+    }
+  }
+  if (!best) return;
+  Zone z = *best;
+  switch (z.act) {
+    case Z_EDIT:
+      if (snap.editId == z.id && snap.editIdx == z.idx) sendAction(UI_EDIT, P_NONE);
+      else sendAction(UI_EDIT, z.id, z.idx);
+      what = "edit";
+      break;
+    case Z_STOP:   sendAction(UI_EDIT, P_NONE); what = "stop editing"; break;
+    case Z_TOGGLE: sendAction(UI_TOGGLE, z.id, z.idx); what = "toggle"; break;
+    case Z_PAGE:   openPage((Page)z.id); what = "page"; break;
+    case Z_BACK:
+      page = PG_NONE;
+      // Settings only editable on their page stop being edited when you leave it
+      if (snap.editId != P_FADER && snap.editId != P_GAIN && snap.editId != P_PAN)
+        sendAction(UI_EDIT, P_NONE);
+      what = "back";
+      break;
+    case Z_STRIP:  sendAction(UI_SELECT, z.idx); what = snap.s[z.idx].label; break;
+    case Z_GEAR:   screen = SCR_SETTINGS; what = "settings"; break;
+    case Z_MUTE:
+      sendAction(UI_MUTE);
+      pressedButton = 0;
+      pressedAt = millis();
+      what = "MUTE";
+      break;
+    case Z_SOLO:
+      sendAction(UI_SOLO);
+      pressedButton = 1;
+      pressedAt = millis();
+      what = "SOLO";
+      break;
+    case Z_BAND: {  // EQ page: pick a band, and point the knob at the same setting of it
+      pageBand = z.idx;
+      uint8_t id = snap.editId;
+      if (z.idx == 4) sendAction(UI_EDIT, P_HPF);
+      else if (id >= P_EQ_TYPE && id <= P_EQ_Q) sendAction(UI_EDIT, id, z.idx);
+      else sendAction(UI_EDIT, P_EQ_G, z.idx);
+      what = "band";
+      break;
+    }
   }
 }
 
@@ -1297,7 +1867,8 @@ void settingsTap(int x, int y) {
 void hitTest(int x, int y) {
   const char *what = "nothing";
   switch (view) {
-    case V_MAIN:     mainTap(x, y, what); break;
+    case V_MAIN:
+    case V_PAGE:     zoneTap(x, y, what); break;
     case V_PICKER:   pickerTap(x, y); what = "picker"; break;
     case V_KEYBOARD: keyboardTap(x, y); what = "keyboard"; break;
     case V_SETTINGS: settingsTap(x, y); what = "settings"; break;
@@ -1495,42 +2066,92 @@ void setupTouch() {
 
 // ---------- task ----------
 
+struct Job { Panel *p; uint32_t h; void (*draw)(LGFX_Sprite &); };
+
+void runJobs(Job *jobs, int n) {
+  for (int i = 0; i < n; i++) {
+    Job &j = jobs[i];
+    if (!j.p->w || j.p->hash == j.h) continue;
+    j.p->hash = j.h;
+    beginZones(*j.p);
+    j.draw(j.p->spr);
+    zonePanel = nullptr;
+    j.p->spr.pushSprite(&tft, j.p->x, j.p->y);
+  }
+}
+
+uint32_t detailHash() {
+  Hash h;
+  const Detail &d = snap.d;
+  h.add(snap.sel).add(d.color).add(d.eqOn).add(d.hpOn).q(d.hpf, 1000).add(d.lr).add(d.phantom)
+   .add(d.invert).q(d.pan, 1000).q(d.gain, 1000).add(d.gateOn).add(d.dynOn).add(d.dynRatio)
+   .q(d.gateThr, 1000).q(d.gateRange, 1000).q(d.gateAtt, 1000).q(d.gateHold, 1000).q(d.gateRel, 1000)
+   .q(d.dynThr, 1000).q(d.dynKnee, 1000).q(d.dynAtt, 1000).q(d.dynRel, 1000).q(d.dynMgain, 1000)
+   .q(d.dynMix, 1000).add(snap.editId).add(snap.editIdx);
+  for (const EqBand &b : d.eq) h.add(b.type).q(b.f, 1000).q(b.g, 1000).q(b.q, 1000);
+  for (float x : d.sends) h.q(x, 1000);
+  return h.h;
+}
+
+uint32_t stripsHash() {
+  Hash ho;
+  ho.add(snap.sel);
+  for (const StripView &sv : snap.s) ho.q(sv.fader, 400).q(sv.meter, 1).add(sv.on).add(sv.color).add(sv.haveFader);
+  return ho.h;
+}
+
 void drawMain() {
   const StripView &v = snap.s[snap.sel];
   const Detail &d = snap.d;
   bool flash = millis() - pressedAt < PRESS_FLASH_MS;
+  uint32_t dh = detailHash();
+  char edit[20] = "";
+  if (snap.editId) paramText(snap.editId, snap.editIdx, edit, sizeof(edit));
 
   Hash hh;
-  hh.add(snap.sel).str(v.label).str(v.name).add(v.color).add(v.on).add(d.solo).add(d.lr).add(flash);
+  hh.add(snap.sel).str(v.label).str(v.name).add(v.color).add(v.on).add(d.solo).add(flash)
+    .add(snap.editId).add(snap.editIdx).str(edit);
   Hash hl;
   hl.add(snap.sel).q(v.fader, 1023).add(v.haveFader).q(v.meter, 2).add(v.color)
-    .add(snap.pickedUp).add(snap.faderTouched).q(snap.pickedUp ? 0 : snap.faderPos, 200);
-  Hash he;
-  he.add(snap.sel).add(d.color).add(d.eqOn).add(d.hpOn).q(d.hpf, 1000);
-  for (const EqBand &b : d.eq) he.add(b.type).q(b.f, 1000).q(b.g, 1000).q(b.q, 1000);
-  Hash hi;
-  hi.add(snap.sel).add(snap.meterSeq).add(d.gateOn).q(d.gateThr, 1000).add(d.dynOn)
-    .q(d.dynThr, 1000).add(d.dynRatio);
-  Hash hp;
-  hp.add(snap.sel).add(d.color).q(d.gain, 1000).add(d.phantom).add(d.invert).add(d.lr).q(d.pan, 1000);
-  Hash hs;
-  hs.add(snap.sel);
-  for (float x : d.sends) hs.q(x, 1000);
-  Hash ho;
-  ho.add(snap.sel);
-  for (const StripView &sv : snap.s) ho.q(sv.fader, 400).q(sv.meter, 1).add(sv.on).add(sv.color).add(sv.haveFader);
+    .add(snap.pickedUp).add(snap.faderTouched).q(snap.pickedUp ? 0 : snap.faderPos, 200)
+    .add(editing(P_FADER));
+  Hash hd;
+  hd.add(dh).q(v.meter, 0.5f);  // the live dot on the mini curves
 
-  struct { Panel *p; uint32_t h; void (*draw)(LGFX_Sprite &); } jobs[] = {
-    {&pHeader, hh.h, drawHeader}, {&pLevel, hl.h, drawLevel}, {&pEq, he.h, drawEq},
-    {&pHistory, hi.h, drawHistory}, {&pPreamp, hp.h, drawPreamp}, {&pSends, hs.h, drawSends},
-    {&pStrips, ho.h, drawStrips},
+  Job jobs[] = {
+    {&pHeader, hh.h, drawHeader}, {&pLevel, hl.h, drawLevel}, {&pEq, dh, drawEqPanel},
+    {&pDyn, hd.h, drawDynPanel}, {&pPreamp, dh, drawPreamp}, {&pSends, dh, drawSends},
+    {&pStrips, stripsHash(), drawStrips},
   };
-  for (auto &j : jobs) {
-    if (j.p->hash == j.h) continue;
-    j.p->hash = j.h;
-    j.draw(j.p->spr);
-    j.p->spr.pushSprite(&tft, j.p->x, j.p->y);
+  runJobs(jobs, 7);
+}
+
+void drawPage() {
+  const StripView &v = snap.s[snap.sel];
+  uint32_t dh = detailHash();
+  Hash ht;
+  ht.add(page).add(snap.sel).str(v.label).str(v.name).add(v.color).add(snap.d.eqOn)
+    .add(snap.d.gateOn).add(snap.d.dynOn);
+  Hash ha, hb;
+  ha.add(dh).add(page).add(pageBand);
+  hb.add(dh).add(page).add(pageBand);
+  void (*drawA)(LGFX_Sprite &) = nullptr;
+  void (*drawB)(LGFX_Sprite &) = nullptr;
+  switch (page) {
+    case PG_EQ:     drawA = drawEqPageA; drawB = drawEqPageB; break;
+    case PG_GATE:
+    case PG_COMP:   drawA = drawDynPageA; drawB = drawDynPageB;
+                    ha.q(v.meter, 1); hb.q(v.meter, 0.5f); break;
+    case PG_SENDS:  drawA = drawSendsPage; break;
+    case PG_PREAMP: drawA = drawPreampPageA; drawB = drawPreampPageB; break;
+    default: return;
   }
+  Job jobs[] = {
+    {&pPgTitle, ht.h, drawPageTitle}, {&pPgA, ha.h, drawA},
+    {&pPgB, hb.h, drawB ? drawB : drawPageTitle}, {&pStrips, stripsHash(), drawStrips},
+  };
+  runJobs(jobs, drawB ? 4 : 2);
+  if (!drawB) runJobs(jobs + 3, 1);
 }
 
 void uiTask(void *) {
@@ -1539,12 +2160,14 @@ void uiTask(void *) {
     uint32_t start = millis();
     takeSnapshot();
     View v = pickView();
-    bool changed = v != view;
+    static Page shownPage = PG_NONE;
+    bool changed = v != view || (v == V_PAGE && page != shownPage);
     view = v;
     if (changed) {
       viewHash = 0;
-      for (Panel *p : PANELS) p->hash = 0;
-      if (view == V_MAIN) tft.fillScreen(C_BG);
+      for (Panel *p : PANELS) { p->hash = 0; p->nz = 0; }
+      if (view == V_PAGE) { shownPage = page; layoutPage(page); }
+      if (view == V_MAIN || view == V_PAGE) tft.fillScreen(C_BG);
     }
 
     uint32_t h;
@@ -1585,10 +2208,13 @@ void uiTask(void *) {
       case V_MAIN:
         drawMain();
         break;
+      case V_PAGE:
+        drawPage();
+        break;
     }
 
     handleTouch();
-    if (view == V_MAIN) drawTapMarker();
+    if (view == V_MAIN || view == V_PAGE) drawTapMarker();
     uint32_t took = millis() - start;
     vTaskDelay(pdMS_TO_TICKS(took < FRAME_MS ? FRAME_MS - took : 1));
   }
@@ -1612,7 +2238,7 @@ void uiBegin() {
   for (Panel *p : PANELS) {
     p->spr.setColorDepth(16);
     p->spr.setPsram(true);
-    p->spr.createSprite(p->w, p->h);
+    if (p->w && p->h) p->spr.createSprite(p->w, p->h);
     p->hash = 0;
   }
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 1, nullptr, 0);
