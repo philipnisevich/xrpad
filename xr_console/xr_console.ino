@@ -75,17 +75,25 @@ const uint32_t TOUCH_HOLD_MS = 150;   // stay live briefly after letting go
 
 const uint32_t MOTOR_PWM_HZ = 20000;  // above hearing, so the motor doesn't whine
 const uint8_t  MOTOR_PWM_BITS = 10;
-const float    MOTOR_MIN_DUTY = 0.65f; // least power that reliably keeps the fader moving on 5 V
-const float    MOTOR_KP     = 5.0f;   // full power until within 20% of travel
+// Measured (USB "V"): speed = MOTOR_K * (power - MOTOR_D0) travel/s.
+const float    MOTOR_K      = 17.0f;
+const float    MOTOR_D0     = 0.22f;  // power that just balances friction
+const float    MOTOR_KP     = 6.0f;   // power per unit of lag behind the glide
+const float    MOTOR_KD     = 0.08f;  // power per travel/s faster than the glide (damping)
+const float    MOTOR_FULL_FRICTION_VEL = 0.5f; // glide speed (travel/s) from which friction is fully offset
+const float    MOVE_VMAX    = 6.0f;   // glide speed limit, travel/s
+const float    MOVE_AMAX    = 60.0f;  // glide acceleration, travel/s^2
 const float    MOTOR_TOL    = 0.008f; // close enough to stop
-const uint32_t MOTOR_BRAKE_MS = 30;   // short brake on arrival to stop coasting
-const uint32_t MOTOR_STALL_MS = 30;   // no progress for this long = add power...
-const float    MOTOR_PROGRESS = 0.01f; // getting this much closer counts as progress
-                                      // (the reading jitters ~0.005 when still)
-const uint32_t MOTOR_KICK_MS = 50;    // ...ramping to full power over this long
-const uint32_t MOTOR_BREAKAWAY_MS = 60; // longest full-power start before giving way to the kick
-const uint32_t MOTOR_END_MS = 80;     // -inf/+10 dB: stopped this long at the end stop = there
-const uint32_t MOTOR_TIMEOUT_MS = 1500;
+const float    MOTOR_STILL_VEL = 0.3f; // travel/s: slower than this counts as stopped
+const uint32_t MOTOR_HOLD_MS = 80;    // brake this long at the end of a move
+const uint32_t MOTOR_SETTLE_CHECK_MS = 80; // after that, check it stayed put
+const uint8_t  MOTOR_CORRECTIONS = 3; // gentle nudges back if it drifted off
+const uint32_t MOTOR_STALL_MS = 25;   // not moving this long while it should: push harder
+const uint32_t MOTOR_KICK_MS = 150;   // ...ramping to full power over this long
+const float    MOTOR_HELD_LAG = 0.2f; // this far behind the glide...
+const uint32_t MOTOR_HELD_MS = 250;   // ...for this long = held or blocked: let go
+const uint32_t MOTOR_TIMEOUT_MS = 800; // glide finished but still not there: give up
+const uint32_t MOTOR_FOLLOW_MS = 300; // targets closer together than this = a stream
 
 const uint16_t XR_PORT      = 10024;
 const uint32_t XREMOTE_MS   = 8000;   // mixer drops subscriptions after 10 s
@@ -343,12 +351,26 @@ float potMinMv = POT_MIN_MV, potMaxMv = POT_MAX_MV;  // set by calibrateFader()
 volatile float motorTarget = 0.0f;
 volatile uint32_t motorSeq = 0;     // bumped for each new move request
 volatile bool motorArrived = false;
+volatile bool motorMoving = false;
 
-void motorDrive(float speed) {  // -1.0 (down) .. 1.0 (up), 0 = coast
+// One input is held high and the other gets the inverted PWM, so the motor
+// alternates between drive and brake (slow decay). Its speed then follows the
+// power evenly, both ways; drive / coast needed far more power to move at all
+// and then lurched. 0 = coast.
+void motorDrive(float speed) {  // -1.0 (down) .. 1.0 (up)
   if (MOTOR_REVERSE) speed = -speed;
-  uint32_t duty = (uint32_t)(fabsf(speed) * ((1 << MOTOR_PWM_BITS) - 1));
-  ledcWrite(MOTOR_IN1, speed > 0.0f ? duty : 0);
-  ledcWrite(MOTOR_IN2, speed < 0.0f ? duty : 0);
+  const uint32_t full = (1 << MOTOR_PWM_BITS) - 1;  // the core treats this as fully on
+  uint32_t off = (uint32_t)((1.0f - min(fabsf(speed), 1.0f)) * full);
+  if (speed == 0.0f) {
+    ledcWrite(MOTOR_IN1, 0);
+    ledcWrite(MOTOR_IN2, 0);
+  } else if (speed > 0.0f) {
+    ledcWrite(MOTOR_IN1, full);
+    ledcWrite(MOTOR_IN2, off);
+  } else {
+    ledcWrite(MOTOR_IN2, full);
+    ledcWrite(MOTOR_IN1, off);
+  }
 }
 
 void motorBrake() {  // both inputs high shorts the motor
@@ -356,106 +378,206 @@ void motorBrake() {  // both inputs high shorts the motor
   ledcWrite(MOTOR_IN2, (1 << MOTOR_PWM_BITS) - 1);
 }
 
+float readFaderPos() {
+  uint32_t mv = 0;
+  for (int i = 0; i < 4; i++) mv += analogReadMilliVolts(POT_PIN);
+  mv /= 4;
+  float raw = constrain(((float)mv - potMinMv) / (potMaxMv - potMinMv), 0.0f, 1.0f);
+  return POT_REVERSE ? 1.0f - raw : raw;
+}
+
+// DEBUG over USB serial: "V" sweeps motor power against speed; "G <0-1000>"
+// moves to a position; "S <from> <to> <ms> <step ms>" sends a stream of
+// targets like the app or encoder; "R" prints the last recording (time,
+// glide setpoint, position, power, every 2 ms).
+volatile bool sweepRequest = false;
+const int REC_LEN = 1000;
+struct RecSample { uint16_t t; int16_t sp, pos, power; };
+RecSample rec[REC_LEN];
+volatile int recCount = REC_LEN;
+uint32_t recStart = 0;
+
+void sweepMotor() {
+  for (int dir = 1; dir >= -1; dir -= 2) {
+    for (int pct = 10; pct <= 60; pct += 5) {
+      motorDrive(-dir * 1.0f);  // back to the start end
+      delay(350);
+      motorDrive(0.0f);
+      delay(80);
+      uint32_t t0 = millis(), tA = 0, tB = 0;
+      float start = readFaderPos();
+      motorDrive(dir * pct / 100.0f);
+      while (millis() - t0 < 1500) {
+        float q = dir > 0 ? readFaderPos() : 1.0f - readFaderPos();
+        if (!tA && q >= 0.3f) tA = millis();
+        if (!tB && q >= 0.7f) { tB = millis(); break; }
+        delay(1);
+      }
+      motorDrive(0.0f);
+      Serial.printf("sweep %s %3d%%: ", dir > 0 ? "up  " : "down", pct);
+      if (tA && tB) Serial.printf("%.2f travel/s\n", 0.4f / ((tB - tA) / 1000.0f));
+      else Serial.printf("slow, moved %.3f in 1.5 s\n", fabsf(readFaderPos() - start));
+      delay(50);
+    }
+  }
+}
+
+void printRecording() {
+  Serial.printf("rec %d samples\n", recCount);
+  for (int i = 0; i < recCount; i++) Serial.printf("r %u %d %d %d\n", rec[i].t, rec[i].sp, rec[i].pos, rec[i].power);
+  Serial.println("rec end");
+}
+
+// Moves follow a glide: a setpoint that speeds up and slows down smoothly
+// towards the target, which the motor tracks. A stream of targets (the app's
+// fader, the encoder) arrives in small steps; the glide plays them back as
+// one steady motion instead of stopping at each step.
 void motorTask(void *) {
-  float smooth = -1.0f, startErr = 0.0f, bestErr = 0.0f;
-  bool moving = false, breakaway = false;
-  uint32_t seenSeq = 0, startAt = 0, brakeUntil = 0, progressAt = 0;
-  // Debug trace of slow moves: position and power every 10 ms.
-  static int16_t tracePos[160];
-  static int8_t tracePwr[160];
-  int traceN = 0;
-  uint32_t traceAt = 0;
-  float tracePower = 0.0f;
-  bool wasMoving = false;
+  float smooth = -1.0f, vel = 0.0f;
+  float target = -1.0f, sp = 0.0f, spVel = 0.0f;
+  float streamVel = 0.0f, progressPos = 0.0f, power = 0.0f;
+  uint32_t streamGap = 0, lastTargetAt = 0, arrivedAt = 0, lagSince = 0;
+  uint32_t progressAt = 0, brakeUntil = 0, checkAt = 0, seenSeq = 0;
+  uint8_t corrections = 0;
+  bool moving = false;
+  uint32_t lastUs = micros(), lastRec = 0;
+
+  auto startGlide = [&](uint32_t now) {
+    moving = true;
+    sp = smooth;
+    spVel = 0;
+    arrivedAt = lagSince = 0;
+    progressAt = now;
+    progressPos = smooth;
+  };
+  auto stop = [&]() {
+    motorDrive(0.0f);
+    power = 0;
+    moving = false;
+    spVel = 0;
+  };
 
   for (;;) {
-    uint32_t mv = 0;
-    for (int i = 0; i < 4; i++) mv += analogReadMilliVolts(POT_PIN);
-    mv /= 4;
-    float raw = constrain(((float)mv - potMinMv) / (potMaxMv - potMinMv), 0.0f, 1.0f);
-    if (POT_REVERSE) raw = 1.0f - raw;
-    smooth = smooth < 0.0f ? raw : smooth + 0.3f * (raw - smooth);
-    potSmooth = smooth;
-
+    uint32_t us = micros();
+    float dt = min((us - lastUs) / 1e6f, 0.01f);
+    lastUs = us;
     uint32_t now = millis();
-    if (brakeUntil && now >= brakeUntil) {
-      motorDrive(0.0f);
-      brakeUntil = 0;
+
+    if (sweepRequest) {
+      stop();
+      sweepMotor();
+      sweepRequest = false;
     }
+
+    float prev = smooth;
+    float pos = readFaderPos();
+    smooth = smooth < 0.0f ? pos : smooth + 0.3f * (pos - smooth);
+    if (prev >= 0.0f && dt > 0.0f) vel += 0.1f * ((smooth - prev) / dt - vel);
+    potSmooth = smooth;
 
     if (motorSeq != seenSeq) {  // new target
       seenSeq = motorSeq;
-      moving = !touched;
-      startAt = now;
-      startErr = fabsf(motorTarget - smooth);
-      bestErr = startErr;
-      progressAt = now;
-      breakaway = true;
-      traceN = 0;
-      traceAt = 0;
+      float t = motorTarget;
+      uint32_t gap = now - lastTargetAt;
+      bool stream = moving && gap < MOTOR_FOLLOW_MS;  // slow turns: a quick step each
+      lastTargetAt = now;
+      target = t;
+      checkAt = 0;
+      corrections = 0;
+      arrivedAt = 0;
+      if (!touched) {
+        if (!moving) startGlide(now);
+        // Aim to reach each value 1.5 steps from now, so the glide is still
+        // on its way when the next one arrives instead of stopping dead.
+        if (stream) {
+          streamGap = constrain(gap, (uint32_t)10, (uint32_t)100);
+          streamVel = constrain((target - sp) * 1000.0f / (streamGap * 1.5f), -MOVE_VMAX, MOVE_VMAX);
+        } else {
+          streamGap = 0;
+          streamVel = 0;
+        }
+      }
     }
 
-    if (moving) {
-      float err = motorTarget - smooth;
-      // -inf and +10 dB aren't aimed at: the motor drives into the end stop
-      // at full power until the fader stops, so it always gets all the way.
-      bool endTarget = motorTarget <= 0.0f || motorTarget >= 1.0f;
-      // Progress = actually getting closer to the target; position noise
-      // alone mustn't count, or a stalled fader looks like it's moving.
-      if (fabsf(err) < bestErr - MOTOR_PROGRESS) {
-        bestErr = fabsf(err);
-        progressAt = now;
-        breakaway = false;  // it's moving: static friction is beaten
+    if (brakeUntil && (now >= brakeUntil || touched || moving)) {
+      if (!moving) motorDrive(0.0f);
+      brakeUntil = 0;
+    }
+    // After stopping, check it stayed on target; nudge it back gently if not.
+    if (!moving && checkAt && now >= checkAt) {
+      checkAt = 0;
+      if (!touched && fabsf(target - smooth) > MOTOR_TOL * 2 && corrections < MOTOR_CORRECTIONS) {
+        corrections++;
+        startGlide(now);
       }
-      if (now - startAt > MOTOR_BREAKAWAY_MS) breakaway = false;
-      uint32_t stuck = now - progressAt;
+    }
 
-      if (touched) {
-        motorDrive(0.0f);
-        moving = false;
-        Serial.printf("[%lu] motor: hand on fader, letting go\n", now);
-      } else if (endTarget && stuck > MOTOR_END_MS) {
-        motorDrive(0.0f);
-        moving = false;
-        motorArrived = true;
-        Serial.printf("[%lu] motor: at end stop in %lu ms (%.3f)\n", now, now - startAt, smooth);
-      } else if (!endTarget && fabsf(err) <= MOTOR_TOL) {
+    if (moving && touched) {
+      stop();
+      Serial.printf("[%lu] motor: hand on fader, letting go\n", now);
+    } else if (moving) {
+      // Advance the glide: the fastest speed that still slows down smoothly
+      // onto the target; a stream also keeps to its own speed.
+      if (streamGap && now - lastTargetAt > streamGap * 3 / 2 + 20) { streamVel = 0; streamGap = 0; }
+      float e = target - sp;
+      float want = copysignf(sqrtf(2.0f * MOVE_AMAX * fabsf(e)), e);
+      if (streamGap) want = streamVel * want >= 0.0f ? copysignf(min(fabsf(streamVel), fabsf(want)), want) : 0.0f;
+      want = constrain(want, -MOVE_VMAX, MOVE_VMAX);
+      spVel += constrain(want - spVel, -MOVE_AMAX * dt, MOVE_AMAX * dt);
+      float next = sp + spVel * dt;
+      if ((next - target) * (sp - target) <= 0.0f) { next = target; spVel = 0; }  // never past it
+      sp = constrain(next, 0.0f, 1.0f);
+
+      float err = target - smooth;
+      float lag = sp - smooth;
+      bool arrived = sp == target && !streamGap;
+      if (arrived && !arrivedAt) arrivedAt = now;
+
+      if (arrived && fabsf(err) <= MOTOR_TOL && fabsf(vel) < MOTOR_STILL_VEL) {
+        // Hold it with the brake for a moment, or it slides on a little.
+        stop();
         motorBrake();
-        brakeUntil = now + MOTOR_BRAKE_MS;
-        moving = false;
+        brakeUntil = now + MOTOR_HOLD_MS;
+        checkAt = brakeUntil + MOTOR_SETTLE_CHECK_MS;
         motorArrived = true;
-        Serial.printf("[%lu] motor: arrived in %lu ms\n", now, now - startAt);
-      } else if (now - startAt > 250 && fabsf(err) > startErr + 0.05f) {
-        motorDrive(0.0f);
-        moving = false;
-        Serial.printf("[%lu] motor: moving away from target, set MOTOR_REVERSE\n", now);
-      } else if (now - startAt > MOTOR_TIMEOUT_MS) {
-        motorDrive(0.0f);
-        moving = false;
+      } else if (arrived && now - arrivedAt > MOTOR_TIMEOUT_MS) {
+        stop();
+        motorArrived = true;
         Serial.printf("[%lu] motor: gave up, %.3f from target\n", now, err);
+      } else if (fabsf(lag) > MOTOR_HELD_LAG && lagSince && now - lagSince > MOTOR_HELD_MS) {
+        stop();
+        Serial.printf("[%lu] motor: held or blocked, letting go\n", now);
       } else {
-        // A resting fader needs more force to get going than to keep moving,
-        // so every move starts at full power until the fader shifts. After
-        // that, if it stalls on low power near the target, ramp back up.
-        float kick = stuck > MOTOR_STALL_MS ? (float)(stuck - MOTOR_STALL_MS) / MOTOR_KICK_MS : 0.0f;
-        float power = constrain(fabsf(err) * MOTOR_KP, MOTOR_MIN_DUTY, 1.0f);
-        power = endTarget || breakaway ? 1.0f : min(power + kick, 1.0f);
-        tracePower = err > 0.0f ? power : -power;
-        motorDrive(tracePower);
-      }
-      if (moving && now - traceAt >= 10 && traceN < 160) {
-        traceAt = now;
-        tracePos[traceN] = (int16_t)lroundf(smooth * 1000.0f);
-        tracePwr[traceN] = (int8_t)lroundf(tracePower * 100.0f);
-        traceN++;
+        if (fabsf(lag) > MOTOR_HELD_LAG) { if (!lagSince) lagSince = now; }
+        else lagSince = 0;
+        // Power: what the glide's speed needs (friction plus speed), plus a
+        // correction for lagging behind it, and damping if it runs faster
+        // than the glide. Friction is only added in the glide's direction,
+        // and in full only at speed: flipping it with every tiny error made
+        // the motor chatter. Stuck behind: push harder, gradually.
+        float u = MOTOR_KP * lag + MOTOR_KD * (spVel - vel);
+        if (fabsf(spVel) > 0.01f)
+          u += copysignf(MOTOR_D0 * min(1.0f, fabsf(spVel) / MOTOR_FULL_FRICTION_VEL) + fabsf(spVel) / MOTOR_K, spVel);
+        else if (fabsf(lag) <= MOTOR_TOL)
+          u = 0;
+        if (fabsf(smooth - progressPos) > 0.004f || fabsf(lag) <= MOTOR_TOL) {
+          progressPos = smooth;
+          progressAt = now;
+        }
+        uint32_t stuck = now - progressAt;
+        if (stuck > MOTOR_STALL_MS) u += copysignf((float)(stuck - MOTOR_STALL_MS) / MOTOR_KICK_MS, lag);
+        power = constrain(u, -1.0f, 1.0f);
+        motorDrive(power);
       }
     }
-    if (wasMoving && !moving && now - startAt > 120) {
-      Serial.printf("[%lu] trace to %.3f, pos x1000 / power %% every 10 ms:\n", now, motorTarget);
-      for (int i = 0; i < traceN; i++) Serial.printf("%d/%d ", tracePos[i], tracePwr[i]);
-      Serial.println();
+    motorMoving = moving;
+
+    if (recCount < REC_LEN && now - lastRec >= 2) {
+      lastRec = now;
+      rec[recCount] = {(uint16_t)(now - recStart), (int16_t)lroundf((moving ? sp : target) * 1000),
+                       (int16_t)lroundf(smooth * 1000), (int16_t)lroundf(power * 1000)};
+      recCount = recCount + 1;
     }
-    wasMoving = moving;
     vTaskDelay(1);
   }
 }
@@ -495,11 +617,55 @@ void motorBegin() {
   xTaskCreatePinnedToCore(motorTask, "motor", 4096, nullptr, 3, nullptr, 1);
 }
 
+void setMotorTarget(float t) {
+  motorTarget = t;
+  motorSeq = motorSeq + 1;
+}
+
+// DEBUG motor commands over USB serial (see sweepMotor above).
+void debugCommands(uint32_t now) {
+  static char cmd[40];
+  static int len = 0;
+  static int sFrom = 0, sTo = 0;
+  static uint32_t sMs = 0, sStep = 0, sStart = 0, sLast = 0;
+  static bool streaming = false;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') {
+      if (len < (int)sizeof(cmd) - 1) cmd[len++] = c;
+      continue;
+    }
+    cmd[len] = 0;
+    int a, b, ms, step;
+    if (len && cmd[0] == 'V') sweepRequest = true;
+    if (len && cmd[0] == 'R') printRecording();
+    if (len && cmd[0] == 'G' && sscanf(cmd + 1, "%d", &a) == 1) {
+      recStart = now;
+      recCount = 0;
+      setMotorTarget(constrain(a, 0, 1000) / 1000.0f);
+    }
+    if (len && cmd[0] == 'S' && sscanf(cmd + 1, "%d %d %d %d", &a, &b, &ms, &step) == 4 && ms > 0 && step > 0) {
+      recStart = now;
+      recCount = 0;
+      sFrom = a; sTo = b; sMs = ms; sStep = step; sStart = sLast = now;
+      streaming = true;
+      setMotorTarget(constrain(a, 0, 1000) / 1000.0f);
+    }
+    len = 0;
+  }
+  if (streaming && now - sLast >= sStep) {
+    sLast = now;
+    float k = min(1.0f, (float)(now - sStart) / sMs);
+    setMotorTarget(constrain(sFrom + k * (sTo - sFrom), 0.0f, 1000.0f) / 1000.0f);
+    if (k >= 1.0f) streaming = false;
+  }
+}
+
 // Drive the fader to the selected channel's level.
 void requestMove() {
   const Strip &s = strips[selected];
   if (!s.haveFader || potSmooth < 0.0f) return;
-  if (fabsf(potSmooth - s.fader) <= MOTOR_TOL) {
+  if (!motorMoving && fabsf(potSmooth - s.fader) <= MOTOR_TOL) {
     pickedUp = true;
     potPos = s.fader;
     return;
@@ -1824,6 +1990,7 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+  debugCommands(now);
   xSemaphoreTake(stateLock, portMAX_DELAY);
   netService();
   bool online = netState == NET_CONNECTED && WiFi.status() == WL_CONNECTED;
