@@ -60,12 +60,14 @@ const float    MOTOR_KP = 5.0f;
 const float    MOTOR_TOL = 0.008f;
 const float    MOTOR_PROGRESS = 0.01f;   // getting this much closer counts as progress
 const uint32_t MOTOR_BRAKE_MS = 30;
+const uint32_t MOTOR_SETTLE_CHECK_MS = 60; // after braking, wait this long then check the position
+const uint8_t  MOTOR_CORRECTIONS = 3;     // gentle nudges back if it coasted past
 const uint32_t MOTOR_STALL_MS = 30;
 const uint32_t MOTOR_KICK_MS = 50;
 const uint32_t MOTOR_BREAKAWAY_MS = 60;
 const uint32_t MOTOR_END_MS = 80;
 const uint32_t MOTOR_TIMEOUT_MS = 1500;
-const float    MOTOR_SETTLE = 0.012f;    // a re-sent target this close doesn't move the fader
+const uint32_t MOTOR_STAGGER_MS = 25;    // start delay between faders moving together
 
 const uint32_t CAL_DRIVE_MS = 500;
 const float    CAL_END_GAP = 0.015f;    // -inf/+10 dB sit this far in from the end stops
@@ -77,10 +79,11 @@ const float    TOUCH_ON = 0.15f;        // native touch: this far above baseline
 const float    TOUCH_OFF = 0.08f;       // ...and below this = released
 const uint32_t REPORT_MS = 20;
 
-// Without an MPR121, a hand is detected by the fader moving while its motor
-// isn't driving it.
-const float    NOTOUCH_MOVE = 0.02f;
+// A hand is also detected by the fader moving while its motor isn't driving
+// it, which covers a touch pad that isn't working or isn't fitted.
+const float    NOTOUCH_MOVE = 0.03f;
 const uint32_t NOTOUCH_STILL_MS = 400;
+const uint32_t MOTION_SETTLE_MS = 400;  // after the motor stops, before motion counts as a hand
 
 struct Fader {
   float minRaw = 60, maxRaw = 4000;  // calibrated ends
@@ -93,8 +96,14 @@ struct Fader {
   float restPos = -1;                // no-sensor hand detection
   uint32_t movedAt = 0;
   float touchBase = 0;               // native touch: untouched reading
-  bool flip = false;                 // motor wired the other way round (found at calibration,
-  bool flippedThisMove = false;      // corrected on the fly if a move runs the wrong way)
+  bool touchOk = false;              // native touch reading looks sane (else motion only)
+  uint32_t idleSince = 0;            // when the motor last stopped
+  float lastRaw = 0;                 // last wiper reading (for the debug line)
+  uint32_t startAfter = 0;           // staggered start of a move
+  uint32_t checkAt = 0;              // when to check where a move really stopped
+  uint8_t corrections = 0;           // settle-back nudges used by this move
+  bool enabled = false;              // calibrated; a fader that failed is never driven
+  bool flip = false;                 // motor wired the other way round (found at calibration)
 };
 
 Fader faders[MAX_FADERS];
@@ -120,21 +129,35 @@ void drive(int n, float speed) {
 void coast(int n) { digitalWrite(IN2[n], LOW); ledcWrite(IN1[n], 0); }
 void brake(int n) { digitalWrite(IN2[n], HIGH); ledcWrite(IN1[n], PWM_MAX); }
 
+// Median of three reads, so a single dropout from a loose wiper is ignored.
 float readPosition(int n) {
   Fader &f = faders[n];
-  float raw = analogRead(WIPER[n]);
+  int a = analogRead(WIPER[n]), b = analogRead(WIPER[n]), c = analogRead(WIPER[n]);
+  float raw = max(min(a, b), min(max(a, b), c));
+  f.lastRaw = raw;
   float pos = constrain((raw - f.minRaw) / (f.maxRaw - f.minRaw), 0.0f, 1.0f);
   return POT_REVERSE[n] ? 1.0f - pos : pos;
 }
 
 void startMove(int n, float target) {
   Fader &f = faders[n];
+  // Only take the target once the move can start: a target that couldn't be
+  // acted on (fader not read yet, a hand on it) must not look "already done"
+  // when the main board re-sends it.
+  if (!f.enabled || target < 0 || f.touched || f.smooth < 0) {
+    f.moving = false;
+    f.target = -1;
+    return;
+  }
   f.target = target;
-  if (target < 0 || f.touched || f.smooth < 0) { f.moving = false; return; }
   f.moving = true;
   f.breakaway = true;
-  f.flippedThisMove = false;
-  f.startAt = f.progressAt = millis();
+  // Stagger starts so faders moving together don't all draw their
+  // full-power start-up current at the same instant.
+  f.startAfter = millis() + n * MOTOR_STAGGER_MS;
+  f.startAt = f.progressAt = f.startAfter;
+  f.corrections = 0;
+  f.checkAt = 0;
   f.startErr = f.bestErr = fabsf(target - f.smooth);
 }
 
@@ -144,7 +167,21 @@ void updateFader(int n, uint32_t now) {
   f.smooth = f.smooth < 0 ? pos : f.smooth + 0.3f * (pos - f.smooth);
 
   if (f.brakeUntil && now >= f.brakeUntil) { coast(n); f.brakeUntil = 0; }
-  if (!f.moving) return;
+
+  // A fast move can coast past the target after braking: once it has
+  // stopped, nudge it back gently (no full-power start), a few times at most.
+  if (!f.moving && f.checkAt && now >= f.checkAt) {
+    f.checkAt = 0;
+    float e = f.target - f.smooth;
+    if (f.target >= 0 && !f.touched && fabsf(e) > MOTOR_TOL * 2 && f.corrections < MOTOR_CORRECTIONS) {
+      f.corrections++;
+      f.moving = true;
+      f.breakaway = false;
+      f.startAfter = f.startAt = f.progressAt = now;
+      f.startErr = f.bestErr = fabsf(e);
+    }
+  }
+  if (!f.moving || (int32_t)(now - f.startAfter) < 0) return;  // not started yet
 
   float err = f.target - f.smooth;
   bool endTarget = f.target <= 0.0f || f.target >= 1.0f;
@@ -167,22 +204,14 @@ void updateFader(int n, uint32_t now) {
     brake(n);
     f.brakeUntil = now + MOTOR_BRAKE_MS;
     f.moving = false;
+    f.checkAt = now + MOTOR_BRAKE_MS + MOTOR_SETTLE_CHECK_MS;  // see where it actually stopped
   } else if (now - f.startAt > 60 && fabsf(err) > f.startErr + 0.03f) {
-    // Running the wrong way: the motor is wired the other way round from
-    // what calibration found. Reverse it and carry on (once per move, so a
-    // bad reading can't make it flip back and forth).
-    if (!f.flippedThisMove) {
-      f.flip = !f.flip;
-      f.flippedThisMove = true;
-      f.startAt = f.progressAt = now;
-      f.startErr = f.bestErr = fabsf(err);
-      f.breakaway = true;
-      Serial.printf("fader %d: was running the wrong way, reversed its motor\n", n + 1);
-    } else {
-      coast(n);
-      f.moving = false;
-      Serial.printf("fader %d: moving away from target either way round, check its wiring\n", n + 1);
-    }
+    // Going the wrong way. Calibration finds each motor's direction, so this
+    // is almost always a hand pulling the fader: let go of it. (Reversing
+    // the motor here once made a correctly-wired fader permanently backwards.)
+    coast(n);
+    f.moving = false;
+    Serial.printf("fader %d: pulled away from its target, letting go\n", n + 1);
   } else if (now - f.startAt > MOTOR_TIMEOUT_MS) {
     coast(n);
     f.moving = false;
@@ -208,19 +237,29 @@ float averageRaw(int n) {
 void calibrate() {
   Serial.println("Calibrating faders");
   float lo[MAX_FADERS], hi[MAX_FADERS];
-  for (int n = 0; n < FADERS; n++) faders[n].flip = false;
-  for (int n = 0; n < FADERS; n++) drive(n, -1.0f);
-  delay(CAL_DRIVE_MS);
-  for (int n = 0; n < FADERS; n++) { lo[n] = averageRaw(n); coast(n); }
-  delay(50);
-  for (int n = 0; n < FADERS; n++) drive(n, 1.0f);
-  delay(CAL_DRIVE_MS);
-  for (int n = 0; n < FADERS; n++) { hi[n] = averageRaw(n); coast(n); }
+  // One fader at a time: every motor stalling at full power together is
+  // more current than a modest supply can give, and the drivers cut out.
+  for (int n = 0; n < FADERS; n++) {
+    faders[n].flip = false;
+    drive(n, -1.0f);
+    delay(CAL_DRIVE_MS);
+    lo[n] = averageRaw(n);
+    coast(n);
+    delay(50);
+    drive(n, 1.0f);
+    delay(CAL_DRIVE_MS);
+    hi[n] = averageRaw(n);
+    coast(n);
+    delay(50);
+  }
   for (int n = 0; n < FADERS; n++) {
     Fader &f = faders[n];
     float a = min(lo[n], hi[n]), b = max(lo[n], hi[n]);
-    if (b - a < CAL_MIN_SPAN) {
-      Serial.printf("fader %d: calibration failed (%.0f-%.0f), check its wiring\n", n + 1, a, b);
+    f.enabled = b - a >= CAL_MIN_SPAN;
+    if (!f.enabled) {  // never drive a fader we can't read
+      coast(n);
+      f.moving = false;
+      Serial.printf("fader %d: calibration failed (%.0f-%.0f), disabled - check its wiring\n", n + 1, a, b);
       continue;
     }
     float gap = (b - a) * CAL_END_GAP;
@@ -230,6 +269,9 @@ void calibrate() {
     // "Down" should lower the position; if it raised it, the motor is the other way round.
     f.flip = (lo[n] > hi[n]) != POT_REVERSE[n];
     Serial.printf("fader %d: %.0f-%.0f%s\n", n + 1, f.minRaw, f.maxRaw, f.flip ? " (motor reversed)" : "");
+    // Targets that arrived while calibrating were never moved to; forget
+    // them so the main board's next re-send moves the fader.
+    f.target = -1;
   }
 }
 
@@ -253,7 +295,11 @@ void calibrateNativeTouch() {
     float sum = 0;
     for (int k = 0; k < 8; k++) sum += touchRead(TOUCH_PIN[n]);
     faders[n].touchBase = sum / 8;
-    Serial.printf("fader %d touch baseline %.0f\n", n + 1, faders[n].touchBase);
+    // A good touch pad reads tens to hundreds of thousands; millions (or the
+    // 4194303 ceiling) means the pin isn't working, so rely on motion instead.
+    faders[n].touchOk = faders[n].touchBase > 1000 && faders[n].touchBase < 1000000;
+    Serial.printf("fader %d touch baseline %.0f%s\n", n + 1, faders[n].touchBase,
+                  faders[n].touchOk ? "" : " (not usable, detecting hands by motion)");
   }
 }
 
@@ -261,18 +307,22 @@ void updateTouch(uint32_t now) {
   uint16_t mask = haveMpr ? mpr.touched() : 0;
   for (int n = 0; n < FADERS; n++) {
     Fader &f = faders[n];
-    bool raw;
-    if (NATIVE_TOUCH) {
-      raw = nativeTouched(f, n);
-    } else if (haveMpr) {
-      raw = mask & (1 << n);
-    } else if (f.moving || f.brakeUntil || f.smooth < 0) {
+    if (!f.enabled) { f.touched = false; continue; }
+    bool raw = false;
+    if (NATIVE_TOUCH && f.touchOk) raw = nativeTouched(f, n);
+    else if (haveMpr) raw = mask & (1 << n);
+
+    // Also a hand: the fader moving while its motor isn't driving it. This
+    // covers a touch pad that isn't working (or isn't fitted).
+    if (f.moving || f.brakeUntil || f.checkAt || f.smooth < 0) {
       f.restPos = f.smooth;  // the motor is moving it, not a hand
-      raw = false;
-    } else {
+      f.idleSince = now;
+    } else if (now - f.idleSince > MOTION_SETTLE_MS) {  // let it coast to rest first
       if (f.restPos < 0) f.restPos = f.smooth;
       if (fabsf(f.smooth - f.restPos) > NOTOUCH_MOVE) { f.restPos = f.smooth; f.movedAt = now; }
-      raw = f.movedAt && now - f.movedAt < NOTOUCH_STILL_MS;
+      if (f.movedAt && now - f.movedAt < NOTOUCH_STILL_MS) raw = true;
+    } else {
+      f.restPos = f.smooth;
     }
     if (raw) {
       f.releasedAt = 0;
@@ -331,7 +381,7 @@ void report() {
   char out[80];
   int len = snprintf(out, sizeof(out), "S %u", mask);
   for (int n = 0; n < MAX_FADERS; n++) {
-    int p = n < FADERS && faders[n].smooth >= 0 ? (int)lroundf(faders[n].smooth * 1000) : -1;
+    int p = n < FADERS && faders[n].enabled && faders[n].smooth >= 0 ? (int)lroundf(faders[n].smooth * 1000) : -1;
     len += snprintf(out + len, sizeof(out) - len, " %d", p);
   }
   Serial1.println(out);
@@ -404,10 +454,10 @@ void motorTask(void *) {
         seen[n] = requestSeq[n];
         float t = requestTarget[n];
         Fader &f = faders[n];
-        // The main board re-sends targets every couple of seconds; don't
-        // nudge a fader that's already sitting on it.
-        if (!motorsOff && !(t == f.target && !f.moving && f.smooth >= 0 && fabsf(t - f.smooth) <= MOTOR_SETTLE))
-          startMove(n, t);
+        // The main board re-sends targets every couple of seconds in case a
+        // line was lost. Only a changed target moves the fader; re-chasing the
+        // same one made a fader that settles slightly off click every resend.
+        if (!motorsOff && t != f.target) startMove(n, t);
       }
       if (motorsOff && faders[n].moving) { faders[n].moving = false; coast(n); }
       updateFader(n, now);
@@ -447,12 +497,13 @@ void loop() {
     Serial.printf("[%lu] link rx %lu bytes, %lu commands | pos", now, linkBytes, linkCommands);
     for (int n = 0; n < FADERS; n++)
       Serial.printf(" %.3f>%.3f%s%s(raw %d, cal %.0f-%.0f)", faders[n].smooth, faders[n].target,
-                    faders[n].moving ? "m" : "", faders[n].flip ? "R" : "", analogRead(WIPER[n]),
+                    faders[n].moving ? "m" : "", faders[n].flip ? "R" : "", (int)faders[n].lastRaw,
                     faders[n].minRaw, faders[n].maxRaw);
     Serial.print(" | touch");
     for (int n = 0; n < FADERS; n++)
       Serial.printf(" %s%.0f/%.0f", faders[n].touched ? "*" : "",
-                    NATIVE_TOUCH ? (float)touchRead(TOUCH_PIN[n]) : 0.0f, faders[n].touchBase);
+                    NATIVE_TOUCH && faders[n].touchOk ? (float)touchRead(TOUCH_PIN[n]) : 0.0f,
+                    faders[n].touchBase);
     Serial.println();
   }
 }
