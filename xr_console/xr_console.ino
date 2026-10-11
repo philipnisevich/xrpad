@@ -8,6 +8,11 @@
 // sends, input history and an overview of all channels. Tap the TFT to mute,
 // solo or select a channel.
 //
+// Wi-Fi is chosen on the TFT: at boot the board scans and joins the most
+// recently used saved network that's in range, otherwise it shows a network
+// picker (with an on-screen keyboard for passwords). The gear in the header
+// opens settings to change network or recalibrate the touchscreen.
+//
 // If you grab the fader while the motor is moving it, the motor lets go and
 // the fader falls back to pickup: it takes control once moved past the
 // channel's level, with an arrow showing which way.
@@ -30,7 +35,9 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <U8g2lib.h>
-#include "secrets.h"
+#include <Preferences.h>
+#include <algorithm>
+#include "secrets.h"  // optional default network, used until one is saved
 
 const uint8_t  ENC_CLK      = 6;
 const uint8_t  ENC_DT       = 5;
@@ -91,6 +98,7 @@ struct Strip {
   char name[16];     // channel name from the mixer
   float fader;       // 0.0 - 1.0
   bool haveFader;
+  bool nameKnown;    // name reply received (names can be empty)
   int8_t on;         // 1 = live, 0 = muted, -1 = unknown
   bool sendDue;      // local change not yet sent
   bool needsFinal;   // resend + confirm once the fader stops
@@ -170,7 +178,7 @@ float dbToFader(float db) {
 SemaphoreHandle_t stateLock;
 
 // Touch actions from the TFT, handled by the main loop (which owns the network).
-enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO };
+enum UiActionType : uint8_t { UI_SELECT, UI_MUTE, UI_SOLO, UI_SCAN };
 struct UiAction { UiActionType type; int8_t arg; };
 QueueHandle_t uiQueue;
 void handleUiAction(const UiAction &a);
@@ -182,10 +190,41 @@ IPAddress mixerIp;
 volatile bool haveMixer = false;
 uint32_t lastRx = 0, lastXremote = 0, lastProbe = 0, lastQuery = 0, lastSend = 0;
 int sweepPos = -1;   // position in the all-strips query sweep, -1 = idle
+bool sweepRepair = false;  // this pass only asks for what's still missing
+int sweepRepairs = 0;
 int detailPos = -1;  // position in the selected-strip query list, -1 = idle
 int detailStrip = 0;
+bool detailDone = false;     // every detail query for the selected strip sent
+uint32_t syncStart = 0;      // when the current mixer was found (0 = none)
+char mixerName[24] = "", mixerModel[16] = "", mixerFw[16] = "";
 bool dirty = true;   // OLED needs redrawing
-volatile int bootStage = 0;  // 0 calibrating fader, 1 joining Wi-Fi, 2 running
+volatile int bootStage = 0;  // 0 calibrating fader, 1 running
+
+// ---------- Wi-Fi ----------
+
+// Not connected and waiting for a choice / joining / joined / join failed.
+enum NetState : uint8_t { NET_IDLE, NET_CONNECTING, NET_CONNECTED, NET_FAILED };
+const int MAX_SCAN = 24, MAX_SAVED = 5;
+const uint32_t JOIN_TIMEOUT_MS = 15000;
+
+struct ScanEntry { char ssid[33]; int8_t rssi; bool open; };
+struct SavedNet { char ssid[33]; char pass[65]; };
+
+volatile NetState netState = NET_IDLE;
+char netSsid[33] = "";           // network being joined or joined
+char joinPass[65] = "";
+uint32_t joinStart = 0;
+ScanEntry scanList[MAX_SCAN];
+int scanCount = 0;
+uint32_t scanSeq = 0;            // bumped when new results arrive
+volatile bool scanning = false;
+bool autoJoinPending = false;    // boot: join a saved network if one is in range
+SavedNet savedNets[MAX_SAVED];   // most recently used first
+int savedCount = 0;
+
+// Set by the TFT task (under stateLock), acted on by the main loop.
+struct JoinRequest { bool pending, useSaved; char ssid[33]; char pass[65]; } joinReq;
+const SavedNet *findSaved(const char *ssid);
 
 // ---------- slide fader state ----------
 
@@ -372,6 +411,177 @@ void requestMove() {
   motorSeq = motorSeq + 1;
 }
 
+// Forget everything read from the mixer, so a new (or re-found) mixer is
+// loaded from scratch and the TFT shows the sync screen again.
+void resetMixerState() {
+  for (int i = 0; i < NUM_STRIPS; i++) {
+    strips[i].haveFader = strips[i].nameKnown = false;
+    strips[i].on = -1;
+    resetDetail(details[i]);
+    meterDb[i] = NAN;
+  }
+  detailDone = false;
+  syncStart = 0;
+  pickedUp = false;
+}
+
+// ---------- Wi-Fi networks ----------
+
+void loadSavedNetworks() {
+  Preferences prefs;
+  prefs.begin("xrnet", true);
+  savedCount = min((int)prefs.getUChar("n", 0), MAX_SAVED);
+  for (int i = 0; i < savedCount; i++) {
+    char key[4];
+    snprintf(key, sizeof(key), "s%d", i);
+    prefs.getString(key, savedNets[i].ssid, sizeof(savedNets[i].ssid));
+    snprintf(key, sizeof(key), "p%d", i);
+    prefs.getString(key, savedNets[i].pass, sizeof(savedNets[i].pass));
+  }
+  prefs.end();
+  // First run: start from the network in secrets.h, if one was filled in.
+  if (savedCount == 0 && strlen(WIFI_SSID) && strcmp(WIFI_SSID, "your-wifi-name") != 0) {
+    strlcpy(savedNets[0].ssid, WIFI_SSID, sizeof(savedNets[0].ssid));
+    strlcpy(savedNets[0].pass, WIFI_PASSWORD, sizeof(savedNets[0].pass));
+    savedCount = 1;
+  }
+}
+
+// Moves (or adds) a network to the front of the saved list.
+void rememberNetwork(const char *ssid, const char *pass) {
+  int found = -1;
+  for (int i = 0; i < savedCount; i++)
+    if (!strcmp(savedNets[i].ssid, ssid)) found = i;
+  int last = found >= 0 ? found : min(savedCount, MAX_SAVED - 1);
+  for (int i = last; i > 0; i--) savedNets[i] = savedNets[i - 1];
+  strlcpy(savedNets[0].ssid, ssid, sizeof(savedNets[0].ssid));
+  strlcpy(savedNets[0].pass, pass, sizeof(savedNets[0].pass));
+  if (found < 0 && savedCount < MAX_SAVED) savedCount++;
+
+  Preferences prefs;
+  prefs.begin("xrnet", false);
+  prefs.putUChar("n", savedCount);
+  for (int i = 0; i < savedCount; i++) {
+    char key[4];
+    snprintf(key, sizeof(key), "s%d", i);
+    prefs.putString(key, savedNets[i].ssid);
+    snprintf(key, sizeof(key), "p%d", i);
+    prefs.putString(key, savedNets[i].pass);
+  }
+  prefs.end();
+}
+
+const SavedNet *findSaved(const char *ssid) {
+  for (int i = 0; i < savedCount; i++)
+    if (!strcmp(savedNets[i].ssid, ssid)) return &savedNets[i];
+  return nullptr;
+}
+
+void startScan() {
+  if (scanning) return;
+  scanning = true;
+  WiFi.scanNetworks(true);  // async; results collected in netService()
+}
+
+void startJoin(const char *ssid, const char *pass) {
+  strlcpy(netSsid, ssid, sizeof(netSsid));
+  strlcpy(joinPass, pass, sizeof(joinPass));
+  WiFi.disconnect();
+  WiFi.begin(netSsid, joinPass[0] ? joinPass : nullptr);
+  netState = NET_CONNECTING;
+  joinStart = millis();
+  haveMixer = false;
+  resetMixerState();
+  lastRx = 0;
+  dirty = true;
+  Serial.printf("Joining %s\n", netSsid);
+}
+
+// Called by the TFT task.
+void requestJoin(const char *ssid, const char *pass, bool useSaved) {
+  xSemaphoreTake(stateLock, portMAX_DELAY);
+  strlcpy(joinReq.ssid, ssid, sizeof(joinReq.ssid));
+  strlcpy(joinReq.pass, pass, sizeof(joinReq.pass));
+  joinReq.useSaved = useSaved;
+  joinReq.pending = true;
+  xSemaphoreGive(stateLock);
+}
+
+void collectScan() {
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_RUNNING) return;
+  scanning = false;
+  if (n < 0) {  // failed: try again
+    startScan();
+    return;
+  }
+  scanCount = 0;
+  for (int i = 0; i < n; i++) {  // strongest first, one entry per name
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length()) continue;  // hidden network
+    int dup = -1;
+    for (int j = 0; j < scanCount; j++)
+      if (ssid == scanList[j].ssid) dup = j;
+    int8_t rssi = WiFi.RSSI(i);
+    if (dup >= 0) {
+      scanList[dup].rssi = max(scanList[dup].rssi, rssi);
+      continue;
+    }
+    if (scanCount == MAX_SCAN) continue;
+    ScanEntry &e = scanList[scanCount++];
+    strlcpy(e.ssid, ssid.c_str(), sizeof(e.ssid));
+    e.rssi = rssi;
+    e.open = WiFi.encryptionType(i) == WIFI_AUTH_OPEN;
+  }
+  WiFi.scanDelete();
+  std::sort(scanList, scanList + scanCount,
+            [](const ScanEntry &a, const ScanEntry &b) { return a.rssi > b.rssi; });
+  scanSeq++;
+  Serial.printf("Scan found %d networks\n", scanCount);
+
+  if (autoJoinPending) {  // boot: most recently used saved network in range
+    autoJoinPending = false;
+    for (int i = 0; i < savedCount; i++)
+      for (int j = 0; j < scanCount; j++)
+        if (!strcmp(savedNets[i].ssid, scanList[j].ssid)) {
+          startJoin(savedNets[i].ssid, savedNets[i].pass);
+          return;
+        }
+  }
+}
+
+void netService() {
+  if (scanning) collectScan();
+
+  if (joinReq.pending && !scanning) {
+    joinReq.pending = false;
+    const SavedNet *sv = joinReq.useSaved ? findSaved(joinReq.ssid) : nullptr;
+    startJoin(joinReq.ssid, sv ? sv->pass : joinReq.pass);
+  }
+
+  if (netState == NET_CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      netState = NET_CONNECTED;
+      rememberNetwork(netSsid, joinPass);
+      udp.stop();
+      udp.begin(XR_PORT);
+      lastXremote = 0;
+      dirty = true;
+      Serial.printf("Joined %s, my IP is %s\n", netSsid, WiFi.localIP().toString().c_str());
+      if (strlen(XR18_IP) && mixerIp.fromString(XR18_IP)) {
+        haveMixer = true;
+        syncStart = millis();
+      }
+    } else if (millis() - joinStart > JOIN_TIMEOUT_MS) {  // not `now`: joinStart may be newer
+      WiFi.disconnect();
+      netState = NET_FAILED;
+      dirty = true;
+      Serial.printf("Couldn't join %s\n", netSsid);
+      startScan();
+    }
+  }
+}
+
 // ---------- OSC encoding ----------
 
 size_t padTo4(size_t n) { return (n + 4) & ~3u; }  // includes the null terminator
@@ -504,9 +714,20 @@ void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
   size_t argLen = pos < len ? len - pos : 0;
 
   if (strcmp(address, "/xinfo") == 0) {
+    // Reply args: ip, name, model, firmware
+    const char *field[4] = {"", "", "", ""};
+    size_t p = 0;
+    for (int f = 0; f < 4 && p < argLen; f++) {
+      field[f] = (const char *)arg + p;
+      p += padTo4(strnlen(field[f], argLen - p));
+    }
+    strlcpy(mixerName, field[1], sizeof(mixerName));
+    strlcpy(mixerModel, field[2], sizeof(mixerModel));
+    strlcpy(mixerFw, field[3], sizeof(mixerFw));
     if (!haveMixer) {
       mixerIp = from;
       haveMixer = true;
+      syncStart = millis();
       lastXremote = 0;  // subscribe and start a query sweep right away
       dirty = true;
       Serial.printf("Found mixer at %s\n", from.toString().c_str());
@@ -564,6 +785,7 @@ void handlePacket(const uint8_t *buf, size_t len, IPAddress from) {
       if (strncmp(s.name, (const char *)arg, n) != 0 || s.name[n]) dirty = true;
       memcpy(s.name, arg, n);
       s.name[n] = 0;
+      s.nameKnown = true;
     } else {
       applyDetail(i, suffix, tags, arg, argLen);
     }
@@ -597,6 +819,13 @@ bool detailQuery(int strip, int idx, char *addr, size_t size) {
   return false;
 }
 
+int detailQueryCount(int strip) {
+  char addr[40];
+  int n = 0;
+  while (detailQuery(strip, n, addr, sizeof(addr))) n++;
+  return n;
+}
+
 void runQueries(uint32_t now) {
   // The selected strip's details come first so the TFT fills in quickly.
   if (detailPos >= 0) {
@@ -607,15 +836,36 @@ void runQueries(uint32_t now) {
       sendOsc(mixerIp, addr);
     } else {
       detailPos = -1;
+      if (detailStrip == selected) detailDone = true;
     }
     return;
   }
-  // Then names, faders and mutes of every strip, for the overview.
+  // Then names, faders and mutes of every strip, for the overview. UDP
+  // replies sometimes get lost, so after a full pass, extra passes ask again
+  // for only what's still missing.
   if (sweepPos >= 0 && now - lastQuery >= QUERY_GAP_MS) {
-    lastQuery = now;
     static const char *const SWEEP[] = {"/config/name", "/mix/fader", "/mix/on"};
-    sendStripOsc(strips[sweepPos / 3], SWEEP[sweepPos % 3]);
-    if (++sweepPos >= NUM_STRIPS * 3) sweepPos = -1;
+    auto known = [](int pos) {
+      const Strip &s = strips[pos / 3];
+      return pos % 3 == 0 ? s.nameKnown : pos % 3 == 1 ? s.haveFader : s.on >= 0;
+    };
+    while (sweepRepair && sweepPos < NUM_STRIPS * 3 && known(sweepPos)) sweepPos++;
+    if (sweepPos < NUM_STRIPS * 3) {
+      lastQuery = now;
+      sendStripOsc(strips[sweepPos / 3], SWEEP[sweepPos % 3]);
+      sweepPos++;
+    }
+    if (sweepPos >= NUM_STRIPS * 3) {
+      bool missing = false;
+      for (int p = 0; p < NUM_STRIPS * 3; p++) missing |= !known(p);
+      if (missing && sweepRepairs < 5) {
+        sweepRepairs++;
+        sweepRepair = true;
+        sweepPos = 0;
+      } else {
+        sweepPos = -1;
+      }
+    }
   }
 }
 
@@ -657,6 +907,7 @@ void selectStrip(int i) {
   if (!touched) requestMove();
   detailStrip = selected;  // refresh everything the TFT shows
   detailPos = 0;
+  detailDone = false;
   dirty = true;
   Serial.printf("[%lu] select %s \"%s\"\n", millis(), s.label, s.name);
 }
@@ -664,6 +915,10 @@ void selectStrip(int i) {
 void handleUiAction(const UiAction &a) {
   if (a.type == UI_SELECT) {
     selectStrip(a.arg);
+    return;
+  }
+  if (a.type == UI_SCAN) {
+    startScan();
     return;
   }
   if (!haveMixer) return;
@@ -844,14 +1099,16 @@ void drawMixer() {
 void updateDisplay() {
   static uint32_t lastDraw = 0;
   static int lastMode = -1;
-  int mode = WiFi.status() != WL_CONNECTED ? 0 : !haveMixer ? 1 : 2;
+  bool online = netState == NET_CONNECTED && WiFi.status() == WL_CONNECTED;
+  int mode = netState == NET_CONNECTING ? 0 : !online ? 1 : !haveMixer ? 2 : 3;
   if (mode != lastMode) dirty = true;
   if (!dirty || millis() - lastDraw < FRAME_MS) return;
   lastDraw = millis();
   lastMode = mode;
   dirty = false;
-  if (mode == 0)      drawStatus("Connecting", WIFI_SSID);
-  else if (mode == 1) drawStatus("Finding XR18", "on the network...");
+  if (mode == 0)      drawStatus("Joining", netSsid);
+  else if (mode == 1) drawStatus("Wi-Fi", "Pick one on screen");
+  else if (mode == 2) drawStatus("Finding XR18", "on the network...");
   else                drawMixer();
 }
 
@@ -884,39 +1141,35 @@ void setup() {
   oled.begin();
   drawStatus("Calibrating", "fader...");
   motorBegin();
-  bootStage = 1;
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);  // lower latency
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("Connecting to %s", WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
-    updateDisplay();
-    delay(50);
-  }
-  Serial.printf("\nConnected, my IP is %s\n", WiFi.localIP().toString().c_str());
-  udp.begin(XR_PORT);
-  bootStage = 2;
-
-  if (strlen(XR18_IP) && mixerIp.fromString(XR18_IP)) {
-    haveMixer = true;
-    Serial.printf("Using mixer at %s\n", XR18_IP);
-  }
+  WiFi.setAutoReconnect(true);
+  xSemaphoreTake(stateLock, portMAX_DELAY);
+  loadSavedNetworks();
+  autoJoinPending = savedCount > 0;
+  startScan();
+  xSemaphoreGive(stateLock);
+  bootStage = 1;
 }
 
 void loop() {
   uint32_t now = millis();
   xSemaphoreTake(stateLock, portMAX_DELAY);
+  netService();
+  bool online = netState == NET_CONNECTED && WiFi.status() == WL_CONNECTED;
 
   int size;
-  while ((size = udp.parsePacket()) > 0) {
+  while (online && (size = udp.parsePacket()) > 0) {
     uint8_t buf[512];
     int n = udp.read(buf, sizeof(buf));
     lastRx = now;
     handlePacket(buf, n, udp.remoteIP());
   }
 
-  if (!haveMixer) {
+  if (!online) {
+    // nothing to talk to until Wi-Fi is up
+  } else if (!haveMixer) {
     if (now - lastProbe > 1000) {  // broadcast discovery
       lastProbe = now;
       sendOsc(IPAddress(255, 255, 255, 255), "/xinfo");
@@ -926,7 +1179,11 @@ void loop() {
       lastXremote = now;
       sendOsc(mixerIp, "/xremote");                  // changes from apps/scenes
       sendOscString(mixerIp, "/meters", "/meters/1"); // live input meters
-      if (sweepPos < 0) sweepPos = 0;                // re-read every strip
+      if (sweepPos < 0) {                            // re-read every strip
+        sweepPos = 0;
+        sweepRepair = false;
+        sweepRepairs = 0;
+      }
       if (detailPos < 0) {                           // and the selected one
         detailStrip = selected;
         detailPos = 0;
@@ -937,10 +1194,9 @@ void loop() {
     if (lastRx && now - lastRx > TIMEOUT_MS) {
       Serial.println("Lost contact with mixer");
       lastRx = 0;
-      for (Strip &s : strips) s.haveFader = false;
-      for (float &m : meterDb) m = NAN;
-      pickedUp = false;
+      resetMixerState();
       if (!strlen(XR18_IP)) haveMixer = false;  // rediscover
+      else syncStart = millis();
       dirty = true;
     }
   }
@@ -972,6 +1228,7 @@ void loop() {
   }
 
   for (Strip &s : strips) {
+    if (!online) break;
     if (s.sendDue && now - lastSend >= SEND_GAP_MS) {
       lastSend = now;
       s.sendDue = false;

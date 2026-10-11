@@ -171,7 +171,7 @@ struct StripView {
 };
 
 struct Snap {
-  int mode;  // 0 calibrating fader, 1 joining Wi-Fi, 2 finding mixer, 3 running
+  bool calibrating;  // fader calibration running at boot
   int sel;
   StripView s[NUM_STRIPS];
   Detail d;
@@ -179,13 +179,31 @@ struct Snap {
   uint32_t meterSeq;
   bool pickedUp, faderTouched;
   float faderPos;  // where the physical fader is
+
+  NetState net;
+  bool online, scanning, haveMixer;
+  char netSsid[33];
+  ScanEntry scan[MAX_SCAN];
+  int scanCount;
+  uint32_t scanSeq;
+  char saved[MAX_SAVED][33];
+  int savedCount;
+  int8_t rssi;
+  char ip[16], mixer[16];
+
+  // Loading progress after the mixer is found
+  uint32_t syncStart;
+  int namesKnown, fadersKnown, mutesKnown;
+  float detailFrac;
+  bool metersLive;
+  char mixerName[24], mixerModel[16];
 };
 
 Snap snap;
 
 void takeSnapshot() {
   xSemaphoreTake(stateLock, portMAX_DELAY);
-  snap.mode = bootStage == 0 ? 0 : WiFi.status() != WL_CONNECTED ? 1 : !haveMixer ? 2 : 3;
+  snap.calibrating = bootStage == 0;
   snap.sel = selected;
   for (int i = 0; i < NUM_STRIPS; i++) {
     StripView &v = snap.s[i];
@@ -203,7 +221,43 @@ void takeSnapshot() {
   snap.pickedUp = pickedUp;
   snap.faderTouched = touched && TOUCH_ENABLED;
   snap.faderPos = potSmooth;
+
+  snap.net = netState;
+  snap.online = netState == NET_CONNECTED && WiFi.status() == WL_CONNECTED;
+  snap.scanning = scanning;
+  snap.haveMixer = haveMixer;
+  memcpy(snap.netSsid, netSsid, sizeof(snap.netSsid));
+  snap.scanCount = scanCount;
+  memcpy(snap.scan, scanList, sizeof(ScanEntry) * scanCount);
+  snap.scanSeq = scanSeq;
+  snap.savedCount = savedCount;
+  for (int i = 0; i < savedCount; i++) memcpy(snap.saved[i], savedNets[i].ssid, 33);
+  snap.rssi = snap.online ? WiFi.RSSI() : 0;
+  strlcpy(snap.ip, snap.online ? WiFi.localIP().toString().c_str() : "", sizeof(snap.ip));
+  strlcpy(snap.mixer, haveMixer ? mixerIp.toString().c_str() : "", sizeof(snap.mixer));
+
+  snap.syncStart = syncStart;
+  snap.namesKnown = snap.fadersKnown = snap.mutesKnown = 0;
+  for (const Strip &st : strips) {
+    snap.namesKnown += st.nameKnown;
+    snap.fadersKnown += st.haveFader;
+    snap.mutesKnown += st.on >= 0;
+  }
+  static int detailTotal = 0, detailFor = -1;
+  if (detailFor != detailStrip) { detailFor = detailStrip; detailTotal = detailQueryCount(detailStrip); }
+  snap.detailFrac = detailDone ? 1.0f
+                  : detailPos < 0 || detailStrip != selected ? 0.0f
+                  : constrain((float)detailPos / max(detailTotal, 1), 0.0f, 1.0f);
+  snap.metersLive = !isnan(meterDb[0]);
+  strlcpy(snap.mixerName, mixerName, sizeof(snap.mixerName));
+  strlcpy(snap.mixerModel, mixerModel, sizeof(snap.mixerModel));
   xSemaphoreGive(stateLock);
+}
+
+bool isSaved(const char *ssid) {
+  for (int i = 0; i < snap.savedCount; i++)
+    if (!strcmp(snap.saved[i], ssid)) return true;
+  return false;
 }
 
 // ---------- change detection ----------
@@ -237,6 +291,7 @@ Panel pStrips  = {0, 268, 480, 52};
 Panel *const PANELS[] = {&pHeader, &pLevel, &pEq, &pHistory, &pPreamp, &pSends, &pStrips};
 
 const int16_t MUTE_X = 300, SOLO_X = 390, BTN_Y = 8, BTN_W = 82, BTN_H = 36;
+const int16_t GEAR_X = 272, GEAR_Y = 26;  // settings gear in the header
 const int16_t STRIP_X0 = 6, STRIP_PITCH = 26;
 
 int pressedButton = -1;      // 0 mute, 1 solo, for the tap flash
@@ -283,6 +338,17 @@ void arc(LGFX_Sprite &s, int cx, int cy, int r0, int r1, float a0, float a1, uin
   }
 }
 
+// Settings gear icon; works on the screen or a sprite.
+template <class G>
+void drawGear(G &g, int cx, int cy, uint16_t color, uint16_t bg) {
+  for (int k = 0; k < 8; k++) {
+    float a = k * PI / 4.0f;
+    g.drawWideLine(cx + cosf(a) * 7, cy + sinf(a) * 7, cx + cosf(a) * 11, cy + sinf(a) * 11, 2.2f, color);
+  }
+  g.fillSmoothCircle(cx, cy, 8, color);
+  g.fillSmoothCircle(cx, cy, 3, bg);
+}
+
 // ---------- panels ----------
 
 void drawHeader(LGFX_Sprite &s) {
@@ -306,10 +372,12 @@ void drawHeader(LGFX_Sprite &s) {
 
   const char *name = v.name[0] ? v.name : v.label;
   s.setFont(&fonts::FreeSansBold18pt7b);
-  if (s.textWidth(name) > MUTE_X - 36) s.setFont(&fonts::FreeSansBold12pt7b);
+  if (s.textWidth(name) > GEAR_X - 50) s.setFont(&fonts::FreeSansBold12pt7b);
   s.setTextColor(C_TEXT);
   s.setTextDatum(bottom_left);
   s.drawString(name, 24, 48);
+
+  drawGear(s, GEAR_X, GEAR_Y, C_DIM, C_BG);
 
   // Mute
   bool muted = v.on == 0;
@@ -645,24 +713,250 @@ void drawStrips(LGFX_Sprite &s) {
   }
 }
 
-// ---------- status screens ----------
+// ---------- screens ----------
 
-int statusShown = -1;  // which status screen is on the TFT, 3 = the mixer UI
+enum View { V_STATUS, V_MAIN, V_PICKER, V_KEYBOARD, V_SETTINGS, V_SYNC };
+enum Screen { SCR_AUTO, SCR_PICKER, SCR_KEYBOARD, SCR_SETTINGS };  // where the user navigated
+Screen screen = SCR_AUTO;
+View view = V_STATUS;
+uint32_t viewHash = 0;    // content of the current full-screen view
+char statusLine[64] = "Starting";
+bool statusGear = false;
+char pendingSsid[33];     // network just tapped, until the main loop starts joining it
+uint32_t pendingAt = 0;
 
-// Mode 3 (running) just clears the screen once so the panels draw fresh.
-void drawStatusScreen(int mode) {
+void joinFromUi(const char *ssid, const char *pass, bool useSaved) {
+  requestJoin(ssid, pass, useSaved);
+  strlcpy(pendingSsid, ssid, sizeof(pendingSsid));
+  pendingAt = millis();
+  screen = SCR_AUTO;
+}
+
+void sendAction(UiActionType type, int arg = 0) {
+  UiAction a = {type, (int8_t)arg};
+  xQueueSend(uiQueue, &a, 0);
+}
+
+// ---------- sync screen ----------
+
+// Shown after a mixer is found while its channels load. Progress comes from
+// replies actually received, weighted by how many there are.
+const uint32_t SYNC_MAX_MS = 6000;   // never hold the console back longer than this
+const uint32_t SYNC_READY_MS = 450;  // how long "Ready" shows at 100%
+uint32_t syncSeen = 0;               // syncStart the sync screen last ran for
+uint32_t syncDoneAt = 0;
+bool syncFinished = false;
+float syncShown = 0.0f;              // eased progress, 0..1
+
+struct SyncStep { const char *label; float frac; char count[12]; };
+SyncStep syncSteps[5];
+
+float syncProgress() {
+  const float n = NUM_STRIPS;
+  float f = 0;
+  f += 18.0f * snap.namesKnown / n;
+  f += 18.0f * snap.fadersKnown / n;
+  f += 18.0f * snap.mutesKnown / n;
+  f += 40.0f * snap.detailFrac;
+  f += 6.0f * snap.metersLive;
+  return f / 100.0f;
+}
+
+void buildSyncSteps() {
+  const int n = NUM_STRIPS;
+  syncSteps[0] = {"Channel names", (float)snap.namesKnown / n, ""};
+  snprintf(syncSteps[0].count, 12, "%d/%d", snap.namesKnown, n);
+  syncSteps[1] = {"Faders and mutes", (snap.fadersKnown + snap.mutesKnown) / (2.0f * n), ""};
+  snprintf(syncSteps[1].count, 12, "%d/%d", snap.fadersKnown + snap.mutesKnown, 2 * n);
+  syncSteps[2] = {"EQ, dynamics, preamp, sends", snap.detailFrac, ""};
+  snprintf(syncSteps[2].count, 12, "%d%%", (int)lroundf(snap.detailFrac * 100));
+  syncSteps[3] = {"Live meters", snap.metersLive ? 1.0f : 0.0f, ""};
+  float data = syncProgress();
+  syncSteps[4] = {"Drawing console", data >= 1.0f || syncDoneAt ? 1.0f : 0.0f, ""};
+}
+
+// True while the sync screen should show for the current mixer.
+bool syncing() {
+  if (snap.syncStart != syncSeen) {  // a new mixer (or the same one re-found)
+    syncSeen = snap.syncStart;
+    syncFinished = false;
+    syncDoneAt = 0;
+    syncShown = 0.0f;
+  }
+  if (syncFinished || !snap.syncStart) return false;
+  if (!syncDoneAt && (syncProgress() >= 0.999f || millis() - snap.syncStart > SYNC_MAX_MS)) {
+    syncDoneAt = millis();
+    Serial.printf("[%lu] sync %s in %lu ms: names %d, faders %d, mutes %d, detail %.0f%%, meters %d\n",
+                  millis(), syncProgress() >= 0.999f ? "complete" : "timed out",
+                  millis() - snap.syncStart, snap.namesKnown, snap.fadersKnown, snap.mutesKnown,
+                  snap.detailFrac * 100, snap.metersLive);
+  }
+  if (syncDoneAt && millis() - syncDoneAt > SYNC_READY_MS && syncShown > 0.99f) syncFinished = true;
+  return !syncFinished;
+}
+
+const int SC_X = 70, SC_Y = 34, SC_W = 340, SC_H = 252;
+const int BAR_X = SC_X + 28, BAR_Y = SC_Y + 92, BAR_W = SC_W - 56, BAR_H = 12;
+
+void drawSyncFrame() {
+  tft.fillScreen(C_BG);
+  tft.fillSmoothRoundRect(SC_X, SC_Y, SC_W, SC_H, 14, C_PANEL);
+  tft.drawRoundRect(SC_X, SC_Y, SC_W, SC_H, 14, C_BORDER);
+  tft.setTextDatum(middle_center);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextColor(C_TEXT);
+  tft.drawString("Syncing with mixer", 240, SC_Y + 32);
+  char sub[64];
+  if (snap.mixerName[0])
+    snprintf(sub, sizeof(sub), "%s  -  %s  -  %s", snap.mixerName, snap.mixerModel, snap.mixer);
+  else
+    snprintf(sub, sizeof(sub), "%s", snap.mixer);
+  tft.setFont(&fonts::DejaVu12);
+  tft.setTextColor(C_DIM);
+  tft.drawString(sub, 240, SC_Y + 60);
+}
+
+void drawSyncDynamic(bool full) {
+  static int lastFill = -1;
+  static uint32_t lastSteps = 0;
+  if (full) { lastFill = -1; lastSteps = 0; }
+
+  // Bar and percentage, when the eased value has moved a pixel
+  int fill = (int)lroundf(syncShown * BAR_W);
+  bool ready = syncDoneAt && syncShown > 0.99f;
+  if (fill != lastFill || full) {
+    lastFill = fill;
+    tft.fillSmoothRoundRect(BAR_X, BAR_Y, BAR_W, BAR_H, BAR_H / 2, C_GRAPH);
+    if (fill > 0) tft.fillSmoothRoundRect(BAR_X, BAR_Y, max(fill, BAR_H), BAR_H, BAR_H / 2, ready ? C_GREEN : C_TEAL);
+    tft.fillRect(SC_X + 20, BAR_Y + 18, SC_W - 40, 26, C_PANEL);
+    tft.setTextDatum(middle_center);
+    tft.setFont(&fonts::DejaVu18);
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%d%%", (int)lroundf(syncShown * 100));
+    tft.setTextColor(ready ? C_GREEN : C_TEXT);
+    tft.drawString(ready ? "Ready" : pct, 240, BAR_Y + 31);
+  }
+
+  // Checklist, when a step's state or count changes
+  int y0 = BAR_Y + 56, active = -1;
+  for (int i = 0; i < 5 && active < 0; i++)
+    if (syncSteps[i].frac < 0.999f) active = i;
+  Hash h;
+  h.add(active);
+  for (const SyncStep &st : syncSteps) h.add(st.frac >= 0.999f).str(st.count);
+  if (h.h != lastSteps) {
+    lastSteps = h.h;
+    tft.fillRect(SC_X + 16, y0 - 8, SC_W - 32, 5 * 22 + 4, C_PANEL);
+    for (int i = 0; i < 5; i++) {
+      const SyncStep &st = syncSteps[i];
+      int y = y0 + i * 22, ix = SC_X + 36;
+      bool done = st.frac >= 0.999f;
+      if (done) {
+        tft.fillSmoothCircle(ix, y + 3, 7, C_GREEN);
+        tft.drawWideLine(ix - 3, y + 3, ix - 1, y + 6, 1.2f, C_BG);
+        tft.drawWideLine(ix - 1, y + 6, ix + 4, y, 1.2f, C_BG);
+      } else if (i != active) {
+        tft.fillSmoothCircle(ix, y + 3, 3, C_GRID);
+      }
+      tft.setFont(&fonts::DejaVu12);
+      tft.setTextDatum(middle_left);
+      tft.setTextColor(done || i == active ? C_TEXT : C_FAINT);
+      tft.drawString(st.label, ix + 18, y + 3);
+      if (st.count[0]) {
+        tft.setTextDatum(middle_right);
+        tft.setTextColor(done ? C_DIM : C_FAINT);
+        tft.drawString(st.count, SC_X + SC_W - 30, y + 3);
+      }
+    }
+  }
+
+  // Spinner on the step in progress
+  if (active >= 0) {
+    int ix = SC_X + 36, iy = y0 + active * 22 + 3;
+    tft.fillRect(ix - 9, iy - 9, 19, 19, C_PANEL);
+    tft.drawCircle(ix, iy, 7, C_TEAL);
+    float a = (millis() % 900) / 900.0f * 2 * PI;
+    tft.fillSmoothCircle(ix + cosf(a) * 4, iy + sinf(a) * 4, 2, C_TEAL);
+  }
+}
+
+// Decides what the TFT shows: boot/network status, a Wi-Fi or settings
+// screen, or the mixer view.
+View pickView() {
+  statusGear = true;
+  if (snap.calibrating) {
+    snprintf(statusLine, sizeof(statusLine), "Calibrating fader");
+    statusGear = false;
+    return V_STATUS;
+  }
+  if (screen == SCR_KEYBOARD) return V_KEYBOARD;
+  if (screen == SCR_SETTINGS) return V_SETTINGS;
+  if (screen == SCR_PICKER) return V_PICKER;
+  if (pendingAt && snap.net != NET_CONNECTING && millis() - pendingAt < 1500) {
+    snprintf(statusLine, sizeof(statusLine), "Joining %s", pendingSsid);
+    return V_STATUS;
+  }
+  pendingAt = 0;
+  if (snap.net == NET_CONNECTING) {
+    snprintf(statusLine, sizeof(statusLine), "Joining %s", snap.netSsid);
+    return V_STATUS;
+  }
+  if (snap.net == NET_CONNECTED && !snap.online) {
+    snprintf(statusLine, sizeof(statusLine), "Reconnecting to %s", snap.netSsid);
+    return V_STATUS;
+  }
+  if (snap.net != NET_CONNECTED) {
+    if (snap.net == NET_IDLE && snap.scanning && snap.scanCount == 0) {
+      snprintf(statusLine, sizeof(statusLine), "Looking for Wi-Fi networks");
+      return V_STATUS;
+    }
+    return V_PICKER;  // nothing joined: pick a network
+  }
+  if (!snap.haveMixer) {
+    snprintf(statusLine, sizeof(statusLine), "Looking for the mixer on %s", snap.netSsid);
+    return V_STATUS;
+  }
+  if (syncing()) return V_SYNC;
+  return V_MAIN;
+}
+
+// Rounded button; `accent` fills it.
+void button(int x, int y, int w, int h, const char *label, uint16_t accent = 0, bool enabled = true) {
+  if (accent) tft.fillSmoothRoundRect(x, y, w, h, 8, accent);
+  else {
+    tft.fillSmoothRoundRect(x, y, w, h, 8, C_PANEL);
+    tft.drawRoundRect(x, y, w, h, 8, C_BORDER);
+  }
+  tft.setFont(&fonts::FreeSansBold9pt7b);
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(accent ? C_BG : enabled ? C_TEXT : C_FAINT);
+  tft.drawString(label, x + w / 2, y + h / 2 + 1);
+}
+
+bool inside(int px, int py, int x, int y, int w, int h, int pad = 4) {
+  return px >= x - pad && px < x + w + pad && py >= y - pad && py < y + h + pad;
+}
+
+void signalBars(int x, int yBottom, int rssi, uint16_t color) {
+  int bars = rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : 1;
+  for (int b = 0; b < 4; b++) {
+    int h = 5 + b * 4;
+    tft.fillRect(x + b * 6, yBottom - h, 4, h, b < bars ? color : C_GRID);
+  }
+}
+
+void padlock(int x, int y, uint16_t color) {
+  tft.drawRoundRect(x + 2, y, 8, 9, 3, color);
+  tft.drawRoundRect(x + 3, y + 1, 6, 8, 2, color);
+  tft.fillSmoothRoundRect(x, y + 6, 12, 9, 2, color);
+}
+
+// ---------- status screen ----------
+
+void drawStatusView(bool full) {
   static uint32_t lastDots = 0;
   static int dots = 0;
-  if (mode == 3) {
-    if (statusShown != 3) {
-      statusShown = 3;
-      tft.fillScreen(C_BG);
-      for (Panel *p : PANELS) p->hash = 0;
-    }
-    return;
-  }
-  if (mode != statusShown) {
-    statusShown = mode;
+  if (full) {
     tft.fillScreen(C_BG);
     tft.setTextDatum(middle_center);
     tft.setFont(&fonts::FreeSansBold24pt7b);
@@ -671,15 +965,12 @@ void drawStatusScreen(int mode) {
     tft.setFont(&fonts::DejaVu12);
     tft.setTextColor(C_DIM);
     tft.drawString("FADER CONSOLE", 240, 154);
-    char line[48];
-    if (mode == 0)      snprintf(line, sizeof(line), "Calibrating fader");
-    else if (mode == 1) snprintf(line, sizeof(line), "Joining %s", WIFI_SSID);
-    else                snprintf(line, sizeof(line), "Looking for the mixer");
     tft.setFont(&fonts::DejaVu18);
     tft.setTextColor(C_TEXT);
-    tft.drawString(line, 240, 212);
+    tft.drawString(statusLine, 240, 212);
+    if (statusGear) drawGear(tft, 448, 30, C_DIM, C_BG);
   }
-  if (millis() - lastDots > 300) {  // simple progress dots
+  if (millis() - lastDots > 300) {  // progress dots
     lastDots = millis();
     dots = (dots + 1) % 4;
     for (int i = 0; i < 3; i++)
@@ -687,23 +978,276 @@ void drawStatusScreen(int mode) {
   }
 }
 
-// ---------- touch ----------
+// ---------- Wi-Fi picker ----------
 
-void sendAction(UiActionType type, int arg = 0) {
-  UiAction a = {type, (int8_t)arg};
-  xQueueSend(uiQueue, &a, 0);
+const int PICK_ROWS = 4, PICK_Y = 80, PICK_ROW_H = 46;
+int pickPage = 0;
+
+bool pickerCanGoBack() { return snap.net == NET_CONNECTED && snap.online; }
+
+void drawPicker() {
+  tft.fillScreen(C_BG);
+  tft.setTextDatum(middle_left);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextColor(C_TEXT);
+  tft.drawString("Wi-Fi", 16, 28);
+  if (pickerCanGoBack()) button(276, 10, 90, 36, "BACK");
+  button(376, 10, 94, 36, snap.scanning ? "SCANNING" : "SCAN", 0, !snap.scanning);
+
+  tft.setFont(&fonts::DejaVu12);
+  tft.setTextDatum(middle_left);
+  char line[64];
+  if (snap.net == NET_FAILED) {
+    snprintf(line, sizeof(line), "Couldn't join %s - check the password", snap.netSsid);
+    tft.setTextColor(C_AMBER);
+  } else if (snap.scanning && snap.scanCount == 0) {
+    snprintf(line, sizeof(line), "Looking for networks...");
+    tft.setTextColor(C_DIM);
+  } else if (snap.scanCount == 0) {
+    snprintf(line, sizeof(line), "No networks found - tap SCAN to try again");
+    tft.setTextColor(C_DIM);
+  } else {
+    snprintf(line, sizeof(line), "Tap a network to join it");
+    tft.setTextColor(C_DIM);
+  }
+  tft.drawString(line, 16, 62);
+
+  int pages = max(1, (snap.scanCount + PICK_ROWS - 1) / PICK_ROWS);
+  pickPage = constrain(pickPage, 0, pages - 1);
+  for (int r = 0; r < PICK_ROWS; r++) {
+    int i = pickPage * PICK_ROWS + r;
+    if (i >= snap.scanCount) break;
+    const ScanEntry &e = snap.scan[i];
+    int y = PICK_Y + r * PICK_ROW_H;
+    bool current = snap.online && !strcmp(e.ssid, snap.netSsid);
+    tft.fillSmoothRoundRect(12, y, 456, 42, 8, current ? rgb(24, 44, 40) : C_PANEL);
+    signalBars(26, y + 31, e.rssi, current ? C_TEAL : C_DIM);
+    tft.setFont(&fonts::DejaVu18);
+    tft.setTextDatum(middle_left);
+    tft.setTextColor(C_TEXT);
+    tft.drawString(e.ssid, 60, y + 21);
+    int x = 450;
+    if (!e.open) { padlock(x - 12, y + 13, C_DIM); x -= 22; }
+    const char *tag = current ? "CONNECTED" : isSaved(e.ssid) ? "SAVED" : nullptr;
+    if (tag) {
+      tft.setFont(&fonts::DejaVu9);
+      int w = tft.textWidth(tag) + 12;
+      tft.fillSmoothRoundRect(x - w, y + 14, w, 15, 7, current ? C_TEAL : C_BORDER);
+      tft.setTextDatum(middle_center);
+      tft.setTextColor(current ? C_BG : C_TEXT);
+      tft.drawString(tag, x - w / 2, y + 22);
+    }
+  }
+  if (pages > 1) {
+    button(12, 270, 100, 40, "PREV", 0, pickPage > 0);
+    button(368, 270, 100, 40, "NEXT", 0, pickPage < pages - 1);
+    char t[16];
+    snprintf(t, sizeof(t), "%d / %d", pickPage + 1, pages);
+    tft.setFont(&fonts::DejaVu12);
+    tft.setTextDatum(middle_center);
+    tft.setTextColor(C_DIM);
+    tft.drawString(t, 240, 290);
+  }
 }
 
-bool readTouchScreen(int &x, int &y);
+uint32_t pickerHash() {
+  Hash h;
+  h.add(snap.scanSeq).add(snap.scanning).add(snap.scanCount).add(snap.net).add(snap.online)
+   .add(pickPage).add(snap.savedCount).str(snap.netSsid).add(pickerCanGoBack());
+  return h.h;
+}
 
-const bool SHOW_TAPS = true;  // draw a dot where each tap registered (for checking calibration)
+// ---------- password keyboard ----------
+
+enum KeyKind : uint8_t { K_CHAR, K_SHIFT, K_BACK, K_MODE, K_SPACE, K_SHOW, K_CANCEL, K_JOIN };
+struct Key { int16_t x, y, w, h; char ch; KeyKind kind; };
+Key keys[56];
+int keyCount = 0;
+char kbSsid[33], kbText[65];
+bool kbShift = false, kbSym = false, kbShow = false;
+const int KB_ROW_Y = 86, KB_KEY_H = 42, KB_GAP = 4;
+
+void addKey(int x, int y, int w, char ch, KeyKind kind) {
+  if (keyCount < (int)(sizeof(keys) / sizeof(keys[0]))) keys[keyCount++] = {(int16_t)x, (int16_t)y, (int16_t)w, KB_KEY_H, ch, kind};
+}
+
+void addCharRow(const char *chars, int y, int x0, int x1) {
+  int n = strlen(chars);
+  int w = (x1 - x0 - (n - 1) * KB_GAP) / n;
+  int used = n * w + (n - 1) * KB_GAP, x = x0 + (x1 - x0 - used) / 2;
+  for (int i = 0; i < n; i++, x += w + KB_GAP) addKey(x, y, w, chars[i], K_CHAR);
+}
+
+void buildKeys() {
+  static const char *const LETTERS[] = {"1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"};
+  static const char *const SYMBOLS[] = {"1234567890", "!@#$%^&*()", "-_=+[]{}\\|", ";:'\",./?"};
+  const char *const *rows = kbSym ? SYMBOLS : LETTERS;
+  keyCount = 0;
+  int y = KB_ROW_Y;
+  addCharRow(rows[0], y, 4, 476);
+  y += KB_KEY_H + KB_GAP;
+  addCharRow(rows[1], y, 4, 476);
+  y += KB_KEY_H + KB_GAP;
+  addCharRow(rows[2], y, kbSym ? 4 : 28, kbSym ? 476 : 452);
+  y += KB_KEY_H + KB_GAP;
+  addKey(4, y, 60, 0, K_SHIFT);
+  addCharRow(rows[3], y, 68, 412);
+  addKey(416, y, 60, 0, K_BACK);
+  y += KB_KEY_H + KB_GAP;
+  addKey(4, y, 70, 0, K_MODE);
+  addKey(78, y, 160, ' ', K_SPACE);
+  addKey(242, y, 64, 0, K_SHOW);
+  addKey(310, y, 76, 0, K_CANCEL);
+  addKey(390, y, 86, 0, K_JOIN);
+}
+
+char keyChar(const Key &k) {
+  return (!kbSym && kbShift && k.ch >= 'a' && k.ch <= 'z') ? k.ch - 32 : k.ch;
+}
+
+void drawKbField() {
+  tft.fillRect(0, 26, 480, 54, C_BG);
+  tft.fillSmoothRoundRect(12, 30, 456, 44, 8, C_PANEL);
+  tft.drawRoundRect(12, 30, 456, 44, 8, C_TEAL);
+  char shown[65];
+  size_t n = strlen(kbText);
+  if (kbShow) strlcpy(shown, kbText, sizeof(shown));
+  else { memset(shown, '*', n); shown[n] = 0; }
+  tft.setFont(&fonts::DejaVu18);
+  tft.setTextDatum(middle_left);
+  tft.setTextColor(n ? C_TEXT : C_FAINT);
+  const char *t = n ? shown : "password";
+  // Keep the end of long passwords visible
+  while (*t && tft.textWidth(t) > 420) t++;
+  tft.drawString(t, 26, 52);
+  int cx = 26 + (n ? tft.textWidth(t) : 0) + 2;
+  tft.fillRect(cx, 40, 2, 24, C_TEAL);
+}
+
+void drawKeyboard() {
+  tft.fillScreen(C_BG);
+  tft.setFont(&fonts::DejaVu12);
+  tft.setTextDatum(middle_left);
+  tft.setTextColor(C_DIM);
+  char t[64];
+  snprintf(t, sizeof(t), "Password for %s", kbSsid);
+  tft.drawString(t, 16, 14);
+  drawKbField();
+  buildKeys();
+  for (int i = 0; i < keyCount; i++) {
+    const Key &k = keys[i];
+    uint16_t fill = C_PANEL, text = C_TEXT;
+    char label[8] = {0};
+    switch (k.kind) {
+      case K_CHAR:   label[0] = keyChar(k); break;
+      case K_SPACE:  strcpy(label, "space"); text = C_DIM; break;
+      case K_SHIFT:  strcpy(label, kbSym ? "" : "SHIFT"); if (kbShift && !kbSym) { fill = C_TEXT; text = C_BG; } break;
+      case K_BACK:   strcpy(label, "DEL"); break;
+      case K_MODE:   strcpy(label, kbSym ? "ABC" : "?123"); break;
+      case K_SHOW:   strcpy(label, kbShow ? "HIDE" : "SHOW"); break;
+      case K_CANCEL: strcpy(label, "CANCEL"); text = C_DIM; break;
+      case K_JOIN:   strcpy(label, "JOIN"); fill = C_TEAL; text = C_BG; break;
+    }
+    tft.fillSmoothRoundRect(k.x, k.y, k.w, k.h, 6, fill);
+    tft.setFont(k.kind == K_CHAR ? &fonts::DejaVu18 : &fonts::DejaVu9);
+    tft.setTextDatum(middle_center);
+    tft.setTextColor(text);
+    tft.drawString(label, k.x + k.w / 2, k.y + k.h / 2 + 1);
+  }
+}
+
+uint32_t keyboardHash() { return Hash().add(kbShift).add(kbSym).add(kbShow).str(kbSsid).h; }
+
+void openKeyboard(const char *ssid) {
+  strlcpy(kbSsid, ssid, sizeof(kbSsid));
+  kbText[0] = 0;
+  kbShift = kbSym = kbShow = false;
+  screen = SCR_KEYBOARD;
+}
+
+void keyboardTap(int x, int y) {
+  const Key *hit = nullptr;
+  for (int i = 0; i < keyCount && !hit; i++)
+    if (inside(x, y, keys[i].x, keys[i].y, keys[i].w, keys[i].h, 2)) hit = &keys[i];
+  if (!hit) return;
+  size_t n = strlen(kbText);
+  switch (hit->kind) {
+    case K_CHAR:
+    case K_SPACE:
+      if (n < sizeof(kbText) - 1) {
+        kbText[n] = hit->kind == K_SPACE ? ' ' : keyChar(*hit);
+        kbText[n + 1] = 0;
+      }
+      if (kbShift) kbShift = false;  // one capital, like a phone
+      break;
+    case K_BACK:   if (n) kbText[n - 1] = 0; break;
+    case K_SHIFT:  if (!kbSym) kbShift = !kbShift; break;
+    case K_MODE:   kbSym = !kbSym; kbShift = false; break;
+    case K_SHOW:   kbShow = !kbShow; break;
+    case K_CANCEL: screen = SCR_PICKER; break;
+    case K_JOIN:
+      joinFromUi(kbSsid, kbText, false);
+      break;
+  }
+}
+
+// ---------- settings ----------
+
+void drawSettings() {
+  tft.fillScreen(C_BG);
+  tft.setTextDatum(middle_left);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextColor(C_TEXT);
+  tft.drawString("Settings", 16, 28);
+  button(376, 10, 94, 36, "CLOSE");
+
+  tft.fillSmoothRoundRect(12, 58, 456, 108, 10, C_PANEL);
+  tft.setFont(&fonts::DejaVu9);
+  tft.setTextColor(C_DIM);
+  tft.drawString("WI-FI", 28, 76);
+  tft.drawString("CONTROLLER", 28, 128);
+  tft.drawString("MIXER", 248, 128);
+  tft.setFont(&fonts::DejaVu18);
+  tft.setTextColor(snap.online ? C_TEXT : C_AMBER);
+  tft.drawString(snap.online ? snap.netSsid : "Not connected", 28, 98);
+  if (snap.online) signalBars(430, 106, snap.rssi, C_TEAL);
+  tft.setFont(&fonts::DejaVu12);
+  tft.setTextColor(C_TEXT);
+  tft.drawString(snap.online ? snap.ip : "-", 28, 148);
+  tft.setTextColor(snap.haveMixer ? C_TEXT : C_DIM);
+  tft.drawString(snap.haveMixer ? snap.mixer : "searching...", 248, 148);
+
+  button(12, 182, 222, 52, "CHANGE WI-FI");
+  button(246, 182, 222, 52, "RECALIBRATE TOUCH");
+  tft.setFont(&fonts::DejaVu9);
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(C_FAINT);
+  tft.drawString("Saved networks are joined automatically when they're in range", 240, 262);
+}
+
+uint32_t settingsHash() {
+  Hash h;
+  h.add(snap.online).str(snap.netSsid).str(snap.ip).str(snap.mixer).add(snap.haveMixer)
+   .add((int8_t)(snap.rssi / 6));
+  return h.h;
+}
+
+// ---------- touch ----------
+
+bool readTouchScreen(int &x, int &y);
+void calibrateScreenTouch();
+void saveTouchCalibration();
+
+const bool SHOW_TAPS = false;  // draw a dot where each tap registered (for checking calibration)
 int16_t tapX = -1, tapY = -1;
 uint32_t tapAt = 0;
 
-void hitTest(int x, int y) {
+void mainTap(int x, int y, const char *&what) {
   const int pad = 6;  // forgiving edges around buttons
-  const char *what = "nothing";
-  if (y >= BTN_Y - pad && y < BTN_Y + BTN_H + pad && x >= MUTE_X - pad && x < MUTE_X + BTN_W + pad / 2) {
+  if (inside(x, y, GEAR_X - 22, 0, 44, 52, 0)) {
+    screen = SCR_SETTINGS;
+    what = "settings";
+  } else if (y >= BTN_Y - pad && y < BTN_Y + BTN_H + pad && x >= MUTE_X - pad && x < MUTE_X + BTN_W + pad / 2) {
     sendAction(UI_MUTE);
     pressedButton = 0;
     pressedAt = millis();
@@ -719,6 +1263,47 @@ void hitTest(int x, int y) {
     i = constrain(i, 0, NUM_STRIPS - 1);
     sendAction(UI_SELECT, i);
     what = snap.s[i].label;
+  }
+}
+
+void pickerTap(int x, int y) {
+  if (pickerCanGoBack() && inside(x, y, 276, 10, 90, 36)) { screen = SCR_AUTO; return; }
+  if (inside(x, y, 376, 10, 94, 36)) { sendAction(UI_SCAN); return; }
+  int pages = max(1, (snap.scanCount + PICK_ROWS - 1) / PICK_ROWS);
+  if (pages > 1 && inside(x, y, 12, 270, 100, 40)) { pickPage = max(0, pickPage - 1); return; }
+  if (pages > 1 && inside(x, y, 368, 270, 100, 40)) { pickPage = min(pages - 1, pickPage + 1); return; }
+  for (int r = 0; r < PICK_ROWS; r++) {
+    int i = pickPage * PICK_ROWS + r;
+    if (i >= snap.scanCount || !inside(x, y, 12, PICK_Y + r * PICK_ROW_H, 456, 42, 1)) continue;
+    const ScanEntry &e = snap.scan[i];
+    bool failedHere = snap.net == NET_FAILED && !strcmp(e.ssid, snap.netSsid);
+    if (e.open) joinFromUi(e.ssid, "", false);
+    else if (isSaved(e.ssid) && !failedHere) joinFromUi(e.ssid, "", true);
+    else openKeyboard(e.ssid);  // new network, or its saved password failed
+    return;
+  }
+}
+
+void settingsTap(int x, int y) {
+  if (inside(x, y, 376, 10, 94, 36)) screen = SCR_AUTO;
+  else if (inside(x, y, 12, 182, 222, 52)) { screen = SCR_PICKER; pickPage = 0; sendAction(UI_SCAN); }
+  else if (inside(x, y, 246, 182, 222, 52)) {
+    calibrateScreenTouch();
+    saveTouchCalibration();
+    viewHash = 0;  // redraw settings
+  }
+}
+
+void hitTest(int x, int y) {
+  const char *what = "nothing";
+  switch (view) {
+    case V_MAIN:     mainTap(x, y, what); break;
+    case V_PICKER:   pickerTap(x, y); what = "picker"; break;
+    case V_KEYBOARD: keyboardTap(x, y); what = "keyboard"; break;
+    case V_SETTINGS: settingsTap(x, y); what = "settings"; break;
+    case V_STATUS:
+      if (statusGear && inside(x, y, 420, 4, 56, 52, 0)) { screen = SCR_SETTINGS; what = "settings"; }
+      break;
   }
   Serial.printf("[%lu] tap %d,%d -> %s\n", millis(), x, y, what);
   tapX = x;
@@ -878,6 +1463,14 @@ void calibrateScreenTouch() {
   }
 }
 
+void saveTouchCalibration() {
+  Preferences prefs;
+  prefs.begin("xrpad", false);
+  prefs.putBytes("taff", touchAffine, sizeof(touchAffine));
+  prefs.end();
+  Serial.println("Touchscreen calibrated");
+}
+
 void setupTouch() {
   Preferences prefs;
   prefs.begin("xrpad", false);
@@ -892,61 +1485,110 @@ void setupTouch() {
   }
   if (held) while (tft.getTouchRaw(&tp, 1) > 0) delay(5);  // let go first
 
+  prefs.end();
   if (!have || held) {
     calibrateScreenTouch();
-    prefs.putBytes("taff", touchAffine, sizeof(touchAffine));
-    Serial.println("Touchscreen calibrated");
+    saveTouchCalibration();
   }
   touchCalibrated = true;
-  prefs.end();
 }
 
 // ---------- task ----------
 
+void drawMain() {
+  const StripView &v = snap.s[snap.sel];
+  const Detail &d = snap.d;
+  bool flash = millis() - pressedAt < PRESS_FLASH_MS;
+
+  Hash hh;
+  hh.add(snap.sel).str(v.label).str(v.name).add(v.color).add(v.on).add(d.solo).add(d.lr).add(flash);
+  Hash hl;
+  hl.add(snap.sel).q(v.fader, 1023).add(v.haveFader).q(v.meter, 2).add(v.color)
+    .add(snap.pickedUp).add(snap.faderTouched).q(snap.pickedUp ? 0 : snap.faderPos, 200);
+  Hash he;
+  he.add(snap.sel).add(d.color).add(d.eqOn).add(d.hpOn).q(d.hpf, 1000);
+  for (const EqBand &b : d.eq) he.add(b.type).q(b.f, 1000).q(b.g, 1000).q(b.q, 1000);
+  Hash hi;
+  hi.add(snap.sel).add(snap.meterSeq).add(d.gateOn).q(d.gateThr, 1000).add(d.dynOn)
+    .q(d.dynThr, 1000).add(d.dynRatio);
+  Hash hp;
+  hp.add(snap.sel).add(d.color).q(d.gain, 1000).add(d.phantom).add(d.invert).add(d.lr).q(d.pan, 1000);
+  Hash hs;
+  hs.add(snap.sel);
+  for (float x : d.sends) hs.q(x, 1000);
+  Hash ho;
+  ho.add(snap.sel);
+  for (const StripView &sv : snap.s) ho.q(sv.fader, 400).q(sv.meter, 1).add(sv.on).add(sv.color).add(sv.haveFader);
+
+  struct { Panel *p; uint32_t h; void (*draw)(LGFX_Sprite &); } jobs[] = {
+    {&pHeader, hh.h, drawHeader}, {&pLevel, hl.h, drawLevel}, {&pEq, he.h, drawEq},
+    {&pHistory, hi.h, drawHistory}, {&pPreamp, hp.h, drawPreamp}, {&pSends, hs.h, drawSends},
+    {&pStrips, ho.h, drawStrips},
+  };
+  for (auto &j : jobs) {
+    if (j.p->hash == j.h) continue;
+    j.p->hash = j.h;
+    j.draw(j.p->spr);
+    j.p->spr.pushSprite(&tft, j.p->x, j.p->y);
+  }
+}
+
 void uiTask(void *) {
+  static uint32_t fieldHash = 0;
   for (;;) {
     uint32_t start = millis();
     takeSnapshot();
-    drawStatusScreen(snap.mode);
-    if (snap.mode == 3) {
-      const StripView &v = snap.s[snap.sel];
-      const Detail &d = snap.d;
-      bool flash = millis() - pressedAt < PRESS_FLASH_MS;
-
-      Hash hh;
-      hh.add(snap.sel).str(v.label).str(v.name).add(v.color).add(v.on).add(d.solo).add(d.lr).add(flash);
-      Hash hl;
-      hl.add(snap.sel).q(v.fader, 1023).add(v.haveFader).q(v.meter, 2).add(v.color)
-        .add(snap.pickedUp).add(snap.faderTouched).q(snap.pickedUp ? 0 : snap.faderPos, 200);
-      Hash he;
-      he.add(snap.sel).add(d.color).add(d.eqOn).add(d.hpOn).q(d.hpf, 1000);
-      for (const EqBand &b : d.eq) he.add(b.type).q(b.f, 1000).q(b.g, 1000).q(b.q, 1000);
-      Hash hi;
-      hi.add(snap.sel).add(snap.meterSeq).add(d.gateOn).q(d.gateThr, 1000).add(d.dynOn)
-        .q(d.dynThr, 1000).add(d.dynRatio);
-      Hash hp;
-      hp.add(snap.sel).add(d.color).q(d.gain, 1000).add(d.phantom).add(d.invert).add(d.lr).q(d.pan, 1000);
-      Hash hs;
-      hs.add(snap.sel);
-      for (float x : d.sends) hs.q(x, 1000);
-      Hash ho;
-      ho.add(snap.sel);
-      for (const StripView &sv : snap.s) ho.q(sv.fader, 400).q(sv.meter, 1).add(sv.on).add(sv.color).add(sv.haveFader);
-
-      struct { Panel *p; uint32_t h; void (*draw)(LGFX_Sprite &); } jobs[] = {
-        {&pHeader, hh.h, drawHeader}, {&pLevel, hl.h, drawLevel}, {&pEq, he.h, drawEq},
-        {&pHistory, hi.h, drawHistory}, {&pPreamp, hp.h, drawPreamp}, {&pSends, hs.h, drawSends},
-        {&pStrips, ho.h, drawStrips},
-      };
-      for (auto &j : jobs) {
-        if (j.p->hash == j.h) continue;
-        j.p->hash = j.h;
-        j.draw(j.p->spr);
-        j.p->spr.pushSprite(&tft, j.p->x, j.p->y);
-      }
+    View v = pickView();
+    bool changed = v != view;
+    view = v;
+    if (changed) {
+      viewHash = 0;
+      for (Panel *p : PANELS) p->hash = 0;
+      if (view == V_MAIN) tft.fillScreen(C_BG);
     }
+
+    uint32_t h;
+    switch (view) {
+      case V_STATUS:
+        h = Hash().str(statusLine).add(statusGear).h;
+        drawStatusView(changed || h != viewHash);
+        viewHash = h;
+        break;
+      case V_PICKER:
+        h = pickerHash();
+        if (changed || h != viewHash) { viewHash = h; drawPicker(); }
+        break;
+      case V_KEYBOARD:
+        h = keyboardHash();
+        if (changed || h != viewHash) {
+          viewHash = h;
+          drawKeyboard();
+          fieldHash = Hash().str(kbText).add(kbShow).h;
+        } else if ((h = Hash().str(kbText).add(kbShow).h) != fieldHash) {
+          fieldHash = h;
+          drawKbField();  // typing only redraws the text box
+        }
+        break;
+      case V_SETTINGS:
+        h = settingsHash();
+        if (changed || h != viewHash) { viewHash = h; drawSettings(); }
+        break;
+      case V_SYNC: {
+        float target = syncDoneAt ? 1.0f : syncProgress();
+        syncShown += (target - syncShown) * 0.18f;  // ease towards the real progress
+        if (target - syncShown < 0.002f) syncShown = target;
+        buildSyncSteps();
+        if (changed) drawSyncFrame();
+        drawSyncDynamic(changed);
+        break;
+      }
+      case V_MAIN:
+        drawMain();
+        break;
+    }
+
     handleTouch();
-    if (snap.mode == 3) drawTapMarker();
+    if (view == V_MAIN) drawTapMarker();
     uint32_t took = millis() - start;
     vTaskDelay(pdMS_TO_TICKS(took < FRAME_MS ? FRAME_MS - took : 1));
   }
@@ -961,9 +1603,11 @@ void uiBegin() {
   tft.setRotation(ROTATION);
   pinMode(PIN_BL, OUTPUT);
   digitalWrite(PIN_BL, HIGH);
-  drawStatusScreen(0);
+  statusGear = false;
+  drawStatusView(true);
   setupTouch();
-  statusShown = -1;  // the calibration screen may have replaced the splash
+  view = V_STATUS;
+  viewHash = 0;  // the calibration screen may have replaced the splash
 
   for (Panel *p : PANELS) {
     p->spr.setColorDepth(16);
