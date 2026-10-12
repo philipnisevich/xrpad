@@ -30,6 +30,9 @@
 //                              DC -> G41, SDI -> G17, SCK -> G18, LED -> G40,
 //                              SDO -> G16, T_CLK -> G18, T_CS -> G39,
 //                              T_DIN -> G17, T_DO -> G16, T_IRQ -> G38
+//   Fader board (faders 1-4, or 1-8 with an MPR121)
+//                              its RX G47 <- G13, its TX G48 -> G14, GND
+//   Second fader board (5-8)   its RX G47 <- G1,  its TX G48 -> G2,  GND
 //
 // The fader only sends changes while the knob is being touched, so electrical
 // noise on a fader that's sitting still never moves the mixer.
@@ -53,8 +56,11 @@ const bool     ENC_REVERSE  = false;  // flip if clockwise goes to the previous 
 const bool     POT_REVERSE  = false;  // flip if pushing the fader up lowers the level
 const uint8_t  MOTOR_IN1    = 12;
 const uint8_t  MOTOR_IN2    = 11;
-const uint8_t  FB_TX        = 13;     // link to the 8-fader board (its RX, G44)
-const uint8_t  FB_RX        = 14;     // (its TX, G43)
+const uint8_t  FB_TX        = 13;     // link to the fader board (its RX, G47)
+const uint8_t  FB_RX        = 14;     // (its TX, G48)
+const uint8_t  FB2_TX       = 1;      // link to a second fader board for faders 5-8
+const uint8_t  FB2_RX       = 2;      // (its RX G47, its TX G48)
+const int      FB2_FIRST    = 4;      // bank fader the second board's fader 1 is (0-based)
 const uint32_t FB_BAUD      = 921600;
 const bool     MOTOR_REVERSE = false; // flip if the motor drives away from the target
 
@@ -1798,9 +1804,29 @@ float bankValue(const BankItem &it);
 void applyBankFader(int i, const BankItem &it, float pos, uint32_t now);
 
 volatile uint8_t bank = BANK_1_8;
+// Up to two fader boards, each on its own link and driving its own run of
+// bank faders: one board with 8 faders (MPR121 touch) covers all of them;
+// two boards with 4 each (touch on their own pins) cover 1-4 and 5-8. Both
+// run the same firmware; the main board maps their fader numbers.
+struct FaderLink {
+  HardwareSerial &ser;
+  uint8_t rx, tx;
+  int first;                     // bank fader that this board's fader 0 is
+  bool connected = false, hasTouch = false;
+  int faders = 0;                // from its hello line
+  uint32_t lastLine = 0, rxBytes = 0;
+  uint16_t touch = 0;
+  char buf[96];
+  int len = 0;
+};
+FaderLink links[] = {{Serial1, FB_RX, FB_TX, 0}, {Serial2, FB2_RX, FB2_TX, FB2_FIRST}};
+const int NUM_LINKS = sizeof(links) / sizeof(links[0]);
+void handleBoardLine(FaderLink &k, char *line, uint32_t now);  // own prototype: the IDE's would precede FaderLink
+
+// All boards together, as the UI and bank logic see them.
 bool fbConnected = false, fbHasTouch = false;
 int fbFaders = 0;
-uint32_t fbLastLine = 0, fbLastResend = 0;
+uint32_t fbLastResend = 0;
 float fbPos[BANK_FADERS];        // where each fader is, 0-1 (-1 unknown)
 uint16_t fbTouch = 0, fbWasTouched = 0;
 float fbSent[BANK_FADERS];       // last target sent (-2 = force a send)
@@ -1837,55 +1863,91 @@ void setBank(int b) {
   Serial.printf("[%lu] fader bank %d\n", millis(), b);
 }
 
+// The board driving bank fader i (an earlier board wins an overlap), or -1.
+int linkFor(int i) {
+  for (int l = 0; l < NUM_LINKS; l++) {
+    const FaderLink &k = links[l];
+    if (k.connected && i >= k.first && i < k.first + max(k.faders, 1)) return l;
+  }
+  return -1;
+}
+
 void faderBoardBegin() {
-  Serial1.begin(FB_BAUD, SERIAL_8N1, FB_RX, FB_TX);
   for (int i = 0; i < BANK_FADERS; i++) { fbPos[i] = -1; fbSent[i] = -2; fbApplied[i] = -1; }
-  Serial1.println("?");
+  for (FaderLink &k : links) {
+    k.ser.begin(FB_BAUD, SERIAL_8N1, k.rx, k.tx);
+    k.ser.println("?");
+  }
+  gpio_pullup_en((gpio_num_t)FB2_RX);  // nothing plugged in: idle high, not noise
+}
+
+void handleBoardLine(FaderLink &k, char *line, uint32_t now) {
+  if (line[0] == 'S') {
+    int v[BANK_FADERS], mask;
+    if (sscanf(line + 1, "%d %d %d %d %d %d %d %d %d", &mask, &v[0], &v[1], &v[2], &v[3], &v[4],
+               &v[5], &v[6], &v[7]) == 9) {
+      k.touch = mask;
+      if (!k.connected) {
+        k.connected = true;
+        for (int i = k.first; i < BANK_FADERS; i++) fbSent[i] = -2;  // send it every level
+        k.ser.println("?");
+      }
+      k.lastLine = now;
+      for (int n = 0; n < max(k.faders, 1) && k.first + n < BANK_FADERS; n++)
+        if (linkFor(k.first + n) == &k - links) fbPos[k.first + n] = v[n] < 0 ? -1.0f : v[n] / 1000.0f;
+    }
+  } else if (line[0] == 'H') {
+    int n = 0, t = 0;
+    sscanf(line + 1, "%d %d", &n, &t);
+    k.faders = n;
+    k.hasTouch = t;
+    Serial.printf("Fader board %d: %d faders (bank faders %d-%d), touch sensor %s\n", (int)(&k - links) + 1, n,
+                  k.first + 1, min(k.first + n, BANK_FADERS), t ? "yes" : "no");
+  }
 }
 
 void readFaderBoard(uint32_t now) {
-  static char buf[96];
-  static int len = 0;
-  static uint32_t rxBytes = 0, lastDebug = 0;  // DEBUG: link status every 3 s
+  static uint32_t lastDebug = 0;  // DEBUG: link status every 3 s
   if (now - lastDebug >= 3000) {
     lastDebug = now;
-    Serial.printf("[%lu] fader link: rx %lu bytes, %s\n", now, rxBytes, fbConnected ? "connected" : "no board");
+    Serial.printf("[%lu] fader links:", now);
+    for (int l = 0; l < NUM_LINKS; l++)
+      Serial.printf(" %d: rx %lu bytes, %s;", l + 1, links[l].rxBytes, links[l].connected ? "connected" : "no board");
+    Serial.println();
   }
-  while (Serial1.available()) {
-    char c = Serial1.read();
-    rxBytes++;
-    if (c != '\n' && c != '\r') {
-      if (len < (int)sizeof(buf) - 1) buf[len++] = c;
-      continue;
-    }
-    if (!len) continue;
-    buf[len] = 0;
-    len = 0;
-    if (buf[0] == 'S') {
-      int v[BANK_FADERS], mask;
-      if (sscanf(buf + 1, "%d %d %d %d %d %d %d %d %d", &mask, &v[0], &v[1], &v[2], &v[3], &v[4],
-                 &v[5], &v[6], &v[7]) == 9) {
-        fbTouch = mask;
-        for (int i = 0; i < BANK_FADERS; i++) fbPos[i] = v[i] < 0 ? -1.0f : v[i] / 1000.0f;
-        if (!fbConnected) {
-          fbConnected = true;
-          for (float &x : fbSent) x = -2;
-          Serial1.println("?");
-        }
-        fbLastLine = now;
+  for (FaderLink &k : links) {
+    while (k.ser.available()) {
+      char c = k.ser.read();
+      k.rxBytes++;
+      if (c != '\n' && c != '\r') {
+        if (k.len < (int)sizeof(k.buf) - 1) k.buf[k.len++] = c;
+        continue;
       }
-    } else if (buf[0] == 'H') {
-      int n = 0, t = 0;
-      sscanf(buf + 1, "%d %d", &n, &t);
-      fbFaders = n;
-      fbHasTouch = t;
-      Serial.printf("Fader board: %d faders, touch sensor %s\n", n, t ? "yes" : "no");
+      if (!k.len) continue;
+      k.buf[k.len] = 0;
+      k.len = 0;
+      handleBoardLine(k, k.buf, now);
+    }
+    if (k.connected && now - k.lastLine > FB_TIMEOUT_MS) {
+      k.connected = false;
+      k.touch = 0;
+      for (int i = k.first; i < k.first + max(k.faders, 1) && i < BANK_FADERS; i++) fbPos[i] = -1;
+      Serial.printf("Fader board %d disconnected\n", (int)(&k - links) + 1);
     }
   }
-  if (fbConnected && now - fbLastLine > FB_TIMEOUT_MS) {
-    fbConnected = false;
-    fbTouch = 0;
-    Serial.println("Fader board disconnected");
+  // Combine the boards.
+  fbConnected = fbHasTouch = false;
+  fbFaders = 0;
+  fbTouch = 0;
+  for (const FaderLink &k : links) {
+    if (!k.connected) continue;
+    fbConnected = true;
+    fbHasTouch |= k.hasTouch;
+    fbFaders = max(fbFaders, min(k.first + max(k.faders, 1), BANK_FADERS));
+  }
+  for (int i = 0; i < fbFaders; i++) {
+    int l = linkFor(i);
+    if (l >= 0 && (links[l].touch & (1 << (i - links[l].first)))) fbTouch |= 1 << i;
   }
 }
 
@@ -1936,8 +1998,10 @@ void bankService(uint32_t now) {
     // Not touched: keep the fader on its level (unassigned faders park at the bottom)
     float v = it.kind ? bankValue(it) : 0.0f;
     if (isnan(v)) continue;
+    int l = linkFor(i);
+    if (l < 0) continue;  // no board drives this fader
     if (wasHand || resend || fabsf(v - fbSent[i]) > 0.002f) {
-      Serial1.printf("T %d %d\n", i, (int)lroundf(v * 1000.0f));
+      links[l].ser.printf("T %d %d\n", i - links[l].first, (int)lroundf(v * 1000.0f));
       fbSent[i] = v;
       fbApplied[i] = v;
     }

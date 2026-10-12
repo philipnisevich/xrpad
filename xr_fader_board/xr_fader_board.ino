@@ -24,6 +24,9 @@
 // Temporary 4-fader setup without an MPR121 (NATIVE_TOUCH): faders 1-4 only,
 // with their touch tracks on the ESP32's own touch pins G5..G8 (the wiper
 // pins of faders 5-8, which are unused then). Keep these wires short.
+// For all 8 that way, use two of these boards with this same firmware: the
+// second one's link goes to the main board's G1 (to its G47) and G2 (from
+// its G48), and the main board treats its faders 1-4 as bank faders 5-8.
 //
 // Protocol (921600 baud, text lines):
 //   main -> board  "T <n> <pos>"  move fader n (0-7) to pos 0-1000; pos < 0 = no target
