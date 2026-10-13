@@ -3,30 +3,30 @@
 // the positions the main board asks for, and reports where they are and
 // which ones a hand is on.
 //
-// Each fader runs the same motor control as the console's single fader:
-// full power until it breaks away, gentle near the target, a power kick if
-// it stalls, and -inf/+10 dB drive into the end stops. A hand on a fader
-// stops its motor at once.
+// Each fader follows a glide: a setpoint that speeds up and eases in
+// smoothly, which the motor tracks (feed-forward plus correction, slow-decay
+// PWM). Streams of targets from the app or encoder play back as one steady
+// motion. A hand on a fader stops its motor at once. At power-up all faders
+// calibrate together, then play a short wave show.
 //
-// Wiring (logic is 3V3; motor drivers on their own 5-7 V supply, grounds shared):
-//   Fader n wiper (n = 1-8)    -> G1..G8   (other ends 3V3 / GND)
-//   Fader n motor driver IN1   -> G9..G16  (PWM)
+// Wiring (logic is 3V3; motor drivers on their own 5 V supply, grounds shared):
+//   Fader n wiper (n = 1-8)    -> G1..G8   (top end 3V3, bottom end GND)
+//   Fader n motor driver IN1   -> G9..G16
 //   Fader n motor driver IN2   -> G17, G18, G21, G38, G39, G40, G41, G42
-//   Fader n motor outputs      -> TC1508A motor A/B (two faders per board)
+//   Fader n motor outputs      -> TC1508A MOTOR-A/B (two faders per driver)
 //   Fader n touch track        -> MPR121 ELE0-ELE3 (faders 1-4), ELE5-ELE8 (faders 5-8)
-//   MPR121                     SDA -> G47, SCL -> G48, VCC -> 3V3, GND
-//   Link to main board         TX G48 -> main G14, RX G47 <- main G13, GND
-//                              (G43/G44 aren't on the LCKFB board's headers.
-//                              With the MPR121 on G47/G48 the link moves to
-//                              TX G45 / RX G46; then unplug the link to flash
-//                              this board, as G46 held high blocks download mode.)
+//   MPR121                     SDA -> G47, SCL -> G48, VCC -> 3V3, GND, ADDR -> GND
+//   Link to main board         TX G45 -> main G14, RX G46 <- main G13, GND
+//   Pull-downs (10k to GND)    G45 (else the flash may boot at 1.8 V) and
+//                              G39 (else fader 5 runs up during boot)
+//   Unplug the G46 wire to flash this board: held high it blocks download mode.
+//   (G43/G44 aren't on the LCKFB board's headers.)
 //
-// Temporary 4-fader setup without an MPR121 (NATIVE_TOUCH): faders 1-4 only,
-// with their touch tracks on the ESP32's own touch pins G5..G8 (the wiper
-// pins of faders 5-8, which are unused then). Keep these wires short.
-// For all 8 that way, use two of these boards with this same firmware: the
-// second one's link goes to the main board's G1 (to its G47) and G2 (from
-// its G48), and the main board treats its faders 1-4 as bank faders 5-8.
+// Without an MPR121 (NATIVE_TOUCH): faders 1-4 only, touch on the ESP32's
+// own pins G5..G8, link on TX G48 / RX G47. For 8 faders that way, use two
+// of these boards with this same firmware: the second one's link goes to
+// the main board's G1 (to its G47) and G2 (from its G48), and the main board
+// treats its faders 1-4 as bank faders 5-8.
 //
 // Protocol (921600 baud, text lines):
 //   main -> board  "T <n> <pos>"  move fader n (0-7) to pos 0-1000; pos < 0 = no target

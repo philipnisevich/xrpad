@@ -30,9 +30,10 @@
 //                              DC -> G41, SDI -> G17, SCK -> G18, LED -> G40,
 //                              SDO -> G16, T_CLK -> G18, T_CS -> G39,
 //                              T_DIN -> G17, T_DO -> G16, T_IRQ -> G38
-//   Fader board (faders 1-4, or 1-8 with an MPR121)
-//                              its RX G47 <- G13, its TX G48 -> G14, GND
-//   Second fader board (5-8)   its RX G47 <- G1,  its TX G48 -> G2,  GND
+//   Fader board (xr_fader_board) G13 -> its RX, G14 <- its TX, GND
+//                              (its RX/TX are G46/G45 with an MPR121, else G47/G48)
+//   Second fader board (5-8)   G1 -> its RX G47, G2 <- its TX G48, GND
+//                              (only for two 4-fader boards without an MPR121)
 //
 // The fader only sends changes while the knob is being touched, so electrical
 // noise on a fader that's sitting still never moves the mixer.
