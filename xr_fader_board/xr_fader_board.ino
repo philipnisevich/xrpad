@@ -19,6 +19,9 @@
 //   Link to main board         TX G45 -> main G14, RX G46 <- main G13, GND
 //   Pull-downs (10k to GND)    G45 (else the flash may boot at 1.8 V) and
 //                              G39 (else fader 5 runs up during boot)
+//   Fader display (SSD1306 0.96" OLED, I2C 0x3C) on the same bus: SDA G47,
+//                              SCL G48, VCC 3V3, GND (one for now; a TCA9548A
+//                              multiplexer will give each fader its own)
 //   Unplug the G46 wire to flash this board: held high it blocks download mode.
 //   (G43/G44 aren't on the LCKFB board's headers.)
 //
@@ -32,11 +35,14 @@
 //   main -> board  "T <n> <pos>"  move fader n (0-7) to pos 0-1000; pos < 0 = no target
 //                  "C"            recalibrate all faders
 //                  "?"            ask for the hello line
+//                  "N <n> <on> <solo> <label>|<name>"  what fader n is assigned to, for
+//                                 its display (on 0 = muted; empty label = nothing assigned)
 //   board -> main  "H <faders> <touch sensor>"     hello (at boot and on "?")
 //                  "S <touchmask> <p0> ... <p7>"   every 20 ms, positions 0-1000
 
 #include <Wire.h>
 #include <Adafruit_MPR121.h>
+#include <U8g2lib.h>
 #include <driver/gpio.h>
 #include <esp_rom_gpio.h>
 #include <soc/gpio_sig_map.h>
@@ -529,6 +535,137 @@ void updateTouch(uint32_t now) {
   }
 }
 
+// ---------- displays ----------
+
+// A 0.96" SSD1306 OLED above a fader shows what it's assigned to: label,
+// name, level in dB, and mute and solo. The main board sends the label,
+// name, mute and solo ("N" lines); the level comes from the fader itself.
+// For now one display, straight on the MPR121's I2C bus (address 0x3C);
+// later a TCA9548A multiplexer gives each fader its own.
+//
+// Drawing is fast, but sending a whole screen over I2C takes ~25 ms, which
+// would hold up touch reads on the same bus. So a changed screen is sent one
+// 8-pixel row at a time, one row per pass of loop() (~3 ms each).
+const int DISPLAY_FADER = 0;          // which fader the single display shows (0 = fader 1)
+const uint32_t DISPLAY_MIN_MS = 40;   // redraw at most this often
+
+struct FaderInfo {
+  char label[8] = "";                 // e.g. "CH 1", "BUS 3"; empty = unassigned
+  char name[16] = "";                 // from the mixer
+  bool on = true;                     // false = muted
+  bool solo = false;
+};
+FaderInfo info[MAX_FADERS];
+volatile uint32_t infoSeq = 0;        // bumped when any info changes
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C disp(U8G2_R0, U8X8_PIN_NONE);
+bool haveDisplay = false;
+
+// X-Air fader law: 0.0-1.0 maps to -inf..+10 dB in four linear segments.
+float faderToDb(float f) {
+  if (f >= 0.5f)    return f * 40.0f - 30.0f;
+  if (f >= 0.25f)   return f * 80.0f - 50.0f;
+  if (f >= 0.0625f) return f * 160.0f - 70.0f;
+  return f * 480.0f - 90.0f;
+}
+
+void displayBegin() {
+  Wire.beginTransmission(0x3C);
+  haveDisplay = Wire.endTransmission() == 0;
+  if (!haveDisplay) {
+    Serial.println("No fader display found");
+    return;
+  }
+  disp.setBusClock(400000);
+  disp.begin();
+  disp.setContrast(255);
+  Serial.println("Fader display found");
+}
+
+// Draw fader n's screen into the buffer:
+//   CH 1          -12.5      label, and the level in the corner
+//         Kick               name, as large as fits
+//   [MUTE]        [SOLO]     filled when on, outlined when off
+void drawBadge(int x, const char *text, bool lit) {
+  const int w = 40, y = 52, h = 12;
+  if (lit) {
+    disp.drawRBox(x, y, w, h, 2);
+    disp.setDrawColor(0);
+  } else {
+    disp.drawRFrame(x, y, w, h, 2);
+  }
+  disp.drawStr(x + (w - disp.getStrWidth(text)) / 2, y + 10, text);
+  disp.setDrawColor(1);
+}
+
+void drawFaderScreen(int n, float level) {
+  const FaderInfo &in = info[n];
+  disp.clearBuffer();
+  disp.setFont(u8g2_font_6x10_tr);
+  if (!in.label[0]) {  // nothing on this fader in this bank
+    disp.drawStr((128 - disp.getStrWidth("--")) / 2, 36, "--");
+    return;
+  }
+  disp.drawStr(0, 9, in.label);
+  char db[10];
+  if (level < 0.0f) snprintf(db, sizeof(db), "--");
+  else if (level <= 0.0f) snprintf(db, sizeof(db), "-inf");
+  else snprintf(db, sizeof(db), "%+.1f", faderToDb(level));
+  disp.drawStr(128 - disp.getStrWidth(db), 9, db);
+
+  drawBadge(0, "MUTE", !in.on);
+  drawBadge(88, "SOLO", in.solo);
+
+  // Name, as big as fits (the label if it has no name), between the top
+  // line and the badges.
+  const char *name = in.name[0] ? in.name : in.label;
+  const uint8_t *fonts[] = {u8g2_font_helvB18_tr, u8g2_font_helvB14_tr, u8g2_font_helvB10_tr, u8g2_font_6x12_tr};
+  for (const uint8_t *font : fonts) {
+    disp.setFont(font);
+    if (disp.getStrWidth(name) <= 128 || font == u8g2_font_6x12_tr) break;
+  }
+  const int top = 12, bottom = 50;
+  disp.drawStr(max(0, (128 - disp.getStrWidth(name)) / 2), (top + bottom + disp.getAscent()) / 2, name);
+}
+
+void displayService(uint32_t now) {
+  if (!haveDisplay) return;
+  static uint32_t lastDraw = 0, drawnSeq = ~0u;
+  static int drawnLevel = -2;
+  static int sendRow = 8;  // next 8-pixel row to send (8 = all sent)
+  if (sendRow < 8) {
+    disp.updateDisplayArea(0, sendRow, 16, 1);
+    sendRow++;
+    return;
+  }
+  const Fader &f = faders[DISPLAY_FADER];
+  // Show where the fader is while a hand moves it, otherwise its level.
+  float level = f.touched || f.target < 0 ? f.smooth : f.target;
+  int shown = level < 0 ? -1 : (int)lroundf(level * 1023);  // the mixer's 1023 steps
+  if ((shown != drawnLevel || infoSeq != drawnSeq) && now - lastDraw >= DISPLAY_MIN_MS) {
+    lastDraw = now;
+    drawnLevel = shown;
+    drawnSeq = infoSeq;
+    drawFaderScreen(DISPLAY_FADER, level);
+    sendRow = 0;
+  }
+}
+
+// "N <n> <on> <solo> <label>|<name>" from the main board.
+void handleInfo(char *line) {
+  int n, on, solo, used = 0;
+  if (sscanf(line + 1, "%d %d %d %n", &n, &on, &solo, &used) < 3 || !used || n < 0 || n >= MAX_FADERS) return;
+  char *label = line + 1 + used, *bar = strchr(label, '|');
+  const char *name = bar ? bar + 1 : "";
+  if (bar) *bar = 0;
+  FaderInfo &in = info[n];
+  in.on = on != 0;
+  in.solo = solo != 0;
+  strlcpy(in.label, label, sizeof(in.label));
+  strlcpy(in.name, name, sizeof(in.name));
+  infoSeq = infoSeq + 1;
+}
+
 // ---------- link ----------
 
 void sendHello() { Serial1.printf("H %d %d\n", FADERS, NATIVE_TOUCH || haveMpr ? 1 : 0); }
@@ -548,6 +685,8 @@ void handleLine(char *line, bool fromUsb = false) {
       requestTarget[n] = pos < 0 ? -1.0f : constrain(pos, 0, 1000) / 1000.0f;
       requestSeq[n] = requestSeq[n] + 1;
     }
+  } else if (line[0] == 'N') {
+    handleInfo(line);
   } else if (line[0] == 'C') {
     calRequest = true;
   } else if (line[0] == '?') {
@@ -558,7 +697,7 @@ void handleLine(char *line, bool fromUsb = false) {
 uint32_t linkBytes = 0, linkCommands = 0;
 
 void readLink() {
-  static char buf[48];
+  static char buf[64];
   static int len = 0;
   while (Serial1.available()) {
     char c = Serial1.read();
@@ -608,6 +747,7 @@ void setup() {
     // (With it "off" the library still leaves auto re-tuning on, with no
     // targets, which fails and leaves every input reading near zero.)
     haveMpr = mpr.begin(0x5A, &Wire, 12, 6, true);
+    displayBegin();
     Serial.printf("Fader board: %d faders, MPR121 %s\n", FADERS,
                   haveMpr ? "found" : "not found (detecting hands by motion)");
   }
@@ -817,6 +957,7 @@ void loop() {
   static uint32_t lastTouch = 0, lastReport = 0;
   uint32_t now = millis();
   readLink();
+  displayService(now);
   while (Serial.available()) {  // DEBUG: "M <n>" motor test over USB
     static char cmd[40];
     static int clen = 0;

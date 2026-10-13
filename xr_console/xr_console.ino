@@ -1833,6 +1833,7 @@ uint16_t fbTouch = 0, fbWasTouched = 0;
 float fbSent[BANK_FADERS];       // last target sent (-2 = force a send)
 float fbApplied[BANK_FADERS];    // last position turned into a level
 uint32_t fbOtherSentAt[BANK_FADERS];
+uint32_t fbInfoHash[BANK_FADERS];  // last label/name/mute sent to each fader's display (0 = resend)
 
 BankItem bankItem(int b, int i) {
   switch (b) {
@@ -1890,7 +1891,7 @@ void handleBoardLine(FaderLink &k, char *line, uint32_t now) {
       k.touch = mask;
       if (!k.connected) {
         k.connected = true;
-        for (int i = k.first; i < BANK_FADERS; i++) fbSent[i] = -2;  // send it every level
+        for (int i = k.first; i < BANK_FADERS; i++) fbSent[i] = -2, fbInfoHash[i] = 0;  // send it everything
         k.ser.println("?");
       }
       k.lastLine = now;
@@ -1981,10 +1982,42 @@ void applyBankFader(int i, const BankItem &it, float pos, uint32_t now) {
   fbSent[i] = pos;  // it's already there; no need to send it back
 }
 
+// Tell the fader board what each bank fader is assigned to (label, name,
+// mute, solo), for the displays above the faders: whenever it changes, and with
+// the periodic re-send in case a line was lost.
+
+void sendBankInfo(bool resend) {
+  for (int i = 0; i < BANK_FADERS && i < max(fbFaders, 1); i++) {
+    int l = linkFor(i);
+    if (l < 0) continue;
+    BankItem it = bankItem(bank, i);
+    const char *label = "", *name = "";
+    int8_t on = 1, solo = 0;
+    if (it.kind == 1) {
+      const Strip &st = strips[it.idx];
+      label = st.label; name = st.name; on = st.on;
+      solo = it.idx != MAIN_STRIP && details[it.idx].solo == 1;  // only channels and AUX report solo
+    } else if (it.kind == 2) {
+      const Other &o = others[it.idx];
+      label = o.label; name = o.name; on = o.on;
+    }
+    char line[48];
+    snprintf(line, sizeof(line), "N %d %d %d %s|%s", i - links[l].first, on != 0, solo, label, name);
+    uint32_t h = 2166136261u;  // FNV-1a
+    for (const char *c = line; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+    h |= 1;
+    if (h != fbInfoHash[i] || resend) {
+      links[l].ser.println(line);
+      fbInfoHash[i] = h;
+    }
+  }
+}
+
 void bankService(uint32_t now) {
   if (!fbConnected) return;
   bool resend = now - fbLastResend > FB_RESEND_MS;
   if (resend) fbLastResend = now;
+  sendBankInfo(resend);
   for (int i = 0; i < BANK_FADERS && i < max(fbFaders, 1); i++) {
     BankItem it = bankItem(bank, i);
     bool hand = fbTouch & (1 << i);
