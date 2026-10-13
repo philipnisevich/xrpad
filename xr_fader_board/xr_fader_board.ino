@@ -13,7 +13,7 @@
 //   Fader n motor driver IN1   -> G9..G16  (PWM)
 //   Fader n motor driver IN2   -> G17, G18, G21, G38, G39, G40, G41, G42
 //   Fader n motor outputs      -> TC1508A motor A/B (two faders per board)
-//   Fader n touch track        -> MPR121 ELE0..ELE7
+//   Fader n touch track        -> MPR121 ELE0-ELE3 (faders 1-4), ELE5-ELE8 (faders 5-8)
 //   MPR121                     SDA -> G47, SCL -> G48, VCC -> 3V3, GND
 //   Link to main board         TX G48 -> main G14, RX G47 <- main G13, GND
 //                              (G43/G44 aren't on the LCKFB board's headers.
@@ -42,9 +42,10 @@
 #include <soc/gpio_sig_map.h>
 
 const int MAX_FADERS = 8;
-const int FADERS = 4;               // how many are fitted (1 for testing with a single fader)
-const bool NATIVE_TOUCH = true;     // true: touch on G5-G8 (4 faders max); false: MPR121
+const int FADERS = 8;               // how many are fitted (1 for testing with a single fader)
+const bool NATIVE_TOUCH = false;    // true: touch on G5-G8 (4 faders max); false: MPR121
 const uint8_t TOUCH_PIN[4] = {5, 6, 7, 8};
+const uint8_t MPR_ELECTRODE[MAX_FADERS] = {0, 1, 2, 3, 5, 6, 7, 8};  // ELE4 is skipped
 static_assert(!NATIVE_TOUCH || FADERS <= 4, "native touch uses fader 5-8's wiper pins: 4 faders max");
 
 const uint8_t WIPER[MAX_FADERS] = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -451,12 +452,22 @@ void calibrateNativeTouch() {
 
 void updateTouch(uint32_t now) {
   uint16_t mask = haveMpr ? mpr.touched() : 0;
+  static uint16_t lastMask = 0;  // DEBUG: log each pad touched or let go
+  if (haveMpr && mask != lastMask) {
+    for (int n = 0; n < FADERS; n++) {
+      uint16_t b = 1 << MPR_ELECTRODE[n];
+      if ((mask ^ lastMask) & b)
+        Serial.printf("[%lu] fader %d pad %s (%d/%d)\n", now, n + 1, mask & b ? "touched" : "released",
+                      mpr.filteredData(MPR_ELECTRODE[n]), mpr.baselineData(MPR_ELECTRODE[n]));
+    }
+    lastMask = mask;
+  }
   for (int n = 0; n < FADERS; n++) {
     Fader &f = faders[n];
     if (!f.enabled) { f.touched = false; continue; }
     bool raw = false;
     if (NATIVE_TOUCH && f.touchOk) raw = nativeTouched(f, n);
-    else if (haveMpr) raw = mask & (1 << n);
+    else if (haveMpr) raw = mask & (1 << MPR_ELECTRODE[n]);
 
     // Also a hand: the fader moving while its motor isn't driving it. This
     // covers a touch pad that isn't working (or isn't fitted).
@@ -551,7 +562,10 @@ void setup() {
     calibrateNativeTouch();  // before the motors run, with no hands on the faders
   } else {
     Wire.begin(I2C_SDA, I2C_SCL);
-    haveMpr = mpr.begin(0x5A, &Wire);
+    // Auto-setup on: the chip tunes each input's charge to its wire and fader.
+    // (With it "off" the library still leaves auto re-tuning on, with no
+    // targets, which fails and leaves every input reading near zero.)
+    haveMpr = mpr.begin(0x5A, &Wire, 12, 6, true);
     Serial.printf("Fader board: %d faders, MPR121 %s\n", FADERS,
                   haveMpr ? "found" : "not found (detecting hands by motion)");
   }
@@ -736,6 +750,17 @@ void loop() {
         testStream = {n - 1, a, b, (uint32_t)ms, (uint32_t)step, now, 0};
       }
       if (clen && cmd[0] == 'R') printRecording();
+      int cdc, cdt;  // DEBUG "Q <charge uA 1-63> <time code 1-7>": MPR121 charge settings, then readings
+      if (clen && cmd[0] == 'Q' && haveMpr && sscanf(cmd + 1, "%d %d", &cdc, &cdt) == 2) {
+        mpr.writeRegister(0x5E, 0);  // stop to change settings
+        mpr.writeRegister(0x5C, 0x00 | (cdc & 0x3F));
+        mpr.writeRegister(0x5D, (cdt & 7) << 5);
+        mpr.writeRegister(0x5E, 0x8C);
+        delay(150);
+        Serial.printf("Q %duA t%d:", cdc, cdt);
+        for (int e = 0; e < 12; e++) Serial.printf(" %d", mpr.filteredData(e));
+        Serial.println();
+      }
       if (clen && cmd[0] == 'L') { usbControl = false; Serial.println("main board in control"); }
       if (clen && cmd[0] == 'X') {
         motorsOff = !motorsOff;
@@ -766,10 +791,19 @@ void loop() {
                     faders[n].moving ? "m" : "", faders[n].flip ? "R" : "", (int)faders[n].lastRaw,
                     faders[n].minRaw, faders[n].maxRaw);
     Serial.print(" | touch");
-    for (int n = 0; n < FADERS; n++)
-      Serial.printf(" %s%.0f/%.0f", faders[n].touched ? "*" : "",
-                    faders[n].touchLast,
-                    faders[n].touchBase);
+    for (int n = 0; n < FADERS; n++) {
+      if (haveMpr)  // MPR121: filtered reading / its baseline (a touch drops it 12+ below)
+        Serial.printf(" %s%d/%d", faders[n].touched ? "*" : "", mpr.filteredData(MPR_ELECTRODE[n]),
+                      mpr.baselineData(MPR_ELECTRODE[n]));
+      else
+        Serial.printf(" %s%.0f/%.0f", faders[n].touched ? "*" : "", faders[n].touchLast, faders[n].touchBase);
+    }
+    if (haveMpr) {
+      Serial.printf(" mask %03x | all", mpr.touched());
+      for (int e = 0; e < 12; e++) Serial.printf(" %d", mpr.filteredData(e));
+      Serial.printf(" | ECR %02x OOR %02x%02x CFG %02x %02x", mpr.readRegister8(0x5E), mpr.readRegister8(0x03),
+                    mpr.readRegister8(0x02), mpr.readRegister8(0x5C), mpr.readRegister8(0x5D));
+    }
     Serial.println();
   }
 }
