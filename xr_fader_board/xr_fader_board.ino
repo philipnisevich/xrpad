@@ -337,26 +337,64 @@ float averageRaw(int n) {
   return sum / 16.0f;
 }
 
+// Drive every fader one way (dir -1 down, 1 up) until it stops against its
+// end, and record the reading there.
+void calibrateEnds(float dir, float *end) {
+  const float POWER = 0.7f;
+  const uint32_t RAMP_MS = 80, MIN_MS = 150, STILL_MS = 40, STILL_COUNTS = 12;
+  float last[MAX_FADERS];
+  uint32_t stillSince[MAX_FADERS];
+  bool done[MAX_FADERS];
+  float first[MAX_FADERS];
+  uint32_t movedAt[MAX_FADERS];  // DEBUG: when each fader got going
+  for (int n = 0; n < FADERS; n++) {
+    last[n] = first[n] = analogRead(WIPER[n]);
+    stillSince[n] = 0;
+    done[n] = false;
+    movedAt[n] = 0;
+  }
+  uint32_t t0 = millis();
+  for (int left = FADERS; left > 0;) {
+    uint32_t t = millis() - t0;
+    float power = POWER * min(1.0f, (float)t / RAMP_MS);
+    for (int n = 0; n < FADERS; n++) {
+      if (done[n]) continue;
+      float raw = analogRead(WIPER[n]);
+      if (!movedAt[n] && fabsf(raw - first[n]) > 60) movedAt[n] = t;
+      if (fabsf(raw - last[n]) > STILL_COUNTS) { last[n] = raw; stillSince[n] = t; }
+      // Stopped for a while (or out of time): it's at its end.
+      if ((t > MIN_MS && t - stillSince[n] > STILL_MS) || t > CAL_DRIVE_MS + 300) {
+        coast(n);
+        end[n] = averageRaw(n);
+        done[n] = true;
+        left--;
+      } else {
+        drive(n, dir * power);
+      }
+    }
+    delay(1);
+  }
+  Serial.printf("cal %s: started from", dir > 0 ? "up  " : "down");
+  for (int n = 0; n < FADERS; n++) Serial.printf(" %4.0f", first[n]);
+  Serial.printf("\ncal %s: moved at ms ", dir > 0 ? "up  " : "down");
+  for (int n = 0; n < FADERS; n++) Serial.printf(" %4lu", movedAt[n]);
+  Serial.println();
+  delay(60);  // let them settle before the other way
+}
+
 // Drive every fader into both end stops and record them. This also finds
 // which way each motor is wired, so motor leads can go either way round.
 void calibrate() {
   Serial.println("Calibrating faders");
   float lo[MAX_FADERS], hi[MAX_FADERS];
-  // One fader at a time: every motor stalling at full power together is
-  // more current than a modest supply can give, and the drivers cut out.
-  for (int n = 0; n < FADERS; n++) {
-    faders[n].flip = false;
-    drive(n, -1.0f);
-    delay(CAL_DRIVE_MS);
-    lo[n] = averageRaw(n);
-    coast(n);
-    delay(50);
-    drive(n, 1.0f);
-    delay(CAL_DRIVE_MS);
-    hi[n] = averageRaw(n);
-    coast(n);
-    delay(50);
-  }
+  // All together: every fader dives into its bottom stop, then all spring to
+  // the top. Eight motors pushing into their stops at full power is more
+  // current than the supply gives (the drivers cut out), so the power ramps
+  // up softly, stays below full, and each fader lets go as soon as it has
+  // stopped against its end.
+  for (int n = 0; n < FADERS; n++) faders[n].flip = false;
+  calibrateEnds(-1.0f, lo);
+  calibrateEnds(1.0f, hi);
   for (int n = 0; n < FADERS; n++) {
     Fader &f = faders[n];
     float a = min(lo[n], hi[n]), b = max(lo[n], hi[n]);
@@ -499,6 +537,7 @@ void sendHello() { Serial1.printf("H %d %d\n", FADERS, NATIVE_TOUCH || haveMpr ?
 volatile float requestTarget[MAX_FADERS];
 volatile uint32_t requestSeq[MAX_FADERS];
 volatile bool calRequest = false;
+volatile bool introRequest = false;  // play the power-up show after calibrating
 
 volatile bool usbControl = false;  // DEBUG: USB "G"/"S" commands own the targets until "L"
 
@@ -549,14 +588,17 @@ void report() {
 // ---------- main ----------
 
 void setup() {
-  Serial.begin(115200);
-  Serial.setTxTimeoutMs(0);
-  Serial1.begin(LINK_BAUD, SERIAL_8N1, LINK_RX, LINK_TX);
-  analogReadResolution(12);
+  // Motors off first thing: until then some driver inputs float, and G39
+  // (fader 5's IN2) is pulled high during boot, which runs fader 5 up. A
+  // 10k pull-down from G39 to GND stops it before this code even starts.
   for (int n = 0; n < FADERS; n++) {
     initMotor(n);
     coast(n);
   }
+  Serial.begin(115200);
+  Serial.setTxTimeoutMs(0);
+  Serial1.begin(LINK_BAUD, SERIAL_8N1, LINK_RX, LINK_TX);
+  analogReadResolution(12);
   if (NATIVE_TOUCH) {
     Serial.printf("Fader board: %d faders, touch on G5-G8\n", FADERS);
     calibrateNativeTouch();  // before the motors run, with no hands on the faders
@@ -570,6 +612,7 @@ void setup() {
                   haveMpr ? "found" : "not found (detecting hands by motion)");
   }
   calRequest = true;  // calibrated by the motor task: from setup() the motors didn't move
+  introRequest = true;
   sendHello();
   xTaskCreatePinnedToCore(motorTask, "motors", 4096, nullptr, 5, nullptr, 0);
 }
@@ -595,6 +638,54 @@ void testMotor(int n) {
   coast(n);
   Serial.printf("test fader %d: start %.0f, after forward %.0f, after reverse %.0f -> %s\n", n + 1, a, b, c,
                 fabsf(b - a) > 300 || fabsf(c - b) > 300 ? "MOVES" : "no movement");
+}
+
+// Power-up show, after calibration: a wave rolls across the faders, calms
+// until they all meet in a line at the middle, then they drop like dominoes
+// to the bottom. Positions go through setTarget() 50 times a second, the same
+// smooth glide as a stream from the app, so it flows; a hand on a fader
+// stops that fader as usual. Levels from the main board that arrive during
+// it are picked up straight after.
+float smoothstep(float a, float b, float x) {
+  float t = constrain((x - a) / (b - a), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+void playIntro() {
+  const float WAVE_S = 1.2f;    // one wave period
+  const float FLOW_END = 1.5f;  // wave rolls until here...
+  const float CALM_END = 2.5f;  // ...calms into a line by here...
+  const float DROP_GAP = 0.07f; // ...then drops, one fader after another
+  const float END = CALM_END + DROP_GAP * FADERS + 0.6f;
+  float startPos[MAX_FADERS];
+  for (int n = 0; n < FADERS; n++) {
+    startPos[n] = readPosition(n);
+    faders[n].smooth = startPos[n];
+  }
+  uint32_t t0 = millis(), lastSend = 0, lastUs = micros();
+  for (;;) {
+    uint32_t now = millis();
+    float t = (now - t0) / 1000.0f;
+    if (t > END) break;
+    if (now - lastSend >= 20) {
+      lastSend = now;
+      for (int n = 0; n < FADERS; n++) {
+        float phase = t / WAVE_S - (float)n / FADERS;
+        float amp = 0.38f * smoothstep(0.0f, 0.8f, t) * (1.0f - smoothstep(FLOW_END, CALM_END, t));
+        float wave = 0.5f + amp * sinf(2.0f * PI * phase);
+        // Ease in from where calibration left each fader, staggered left to right.
+        float pos = startPos[n] + (wave - startPos[n]) * smoothstep(0.05f * n, 0.05f * n + 0.6f, t);
+        float dropAt = CALM_END + DROP_GAP * n;
+        if (t >= dropAt) pos = 0.5f * (1.0f - smoothstep(dropAt, dropAt + 0.35f, t));
+        setTarget(n, pos, now);
+      }
+    }
+    uint32_t us = micros();
+    float dt = min((us - lastUs) / 1e6f, 0.01f);
+    lastUs = us;
+    for (int n = 0; n < FADERS; n++) updateFader(n, now, dt);
+    vTaskDelay(1);
+  }
 }
 
 // DEBUG "V <n>": speed at each motor power, both ways, from end stop to end stop.
@@ -674,6 +765,10 @@ void motorTask(void *) {
     if (calRequest) {
       calibrate();
       calRequest = false;
+      if (introRequest) {
+        playIntro();
+        introRequest = false;
+      }
     }
     if (probeFader >= 0) {
       faders[probeFader].moving = false;
