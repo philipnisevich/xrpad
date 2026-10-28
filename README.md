@@ -1,35 +1,15 @@
-# xrpad: a DIY control surface for the Behringer XR18
+# xrpad
 
-A hardware console for the Behringer XR18 digital mixer, built on ESP32-S3
-boards and talking to the mixer over Wi-Fi with OSC. It has:
+A DIY control surface for the Behringer XR18 mixer: two ESP32-S3 boards, OSC
+over Wi-Fi. The main console has a 4" touchscreen, an encoder, an OLED and a
+motorized fader for the selected channel. The fader board drives 8 motorized,
+touch-sensitive bank faders, each with its own 0.96" OLED.
 
-- **8 motorized, touch-sensitive bank faders** that follow banks of channels
-  (1–8, 9–16, returns, buses, DCAs) and move smoothly when levels change in
-  the app.
-- **A motorized "selected channel" fader** on the main console.
-- **A 4.0" touchscreen** showing the selected channel in detail (level and
-  meter, EQ curve, gate, compressor, preamp, sends, insert FX), with pages for
-  editing each section, plus a home screen with channel strips, meters, FX
-  and mixer info.
-- **A rotary encoder** for picking channels and editing whatever setting is
-  tapped on the screen (press to reset it to its default).
-- **A small OLED** with a compact readout.
-- **A Wi-Fi picker** with an on-screen keyboard, saved networks and automatic
-  mixer discovery.
-- **A power-up show:** all faders calibrate together, then a wave rolls across
-  them before they go to their levels.
+![Complete wiring diagram](docs/wiring.png)
 
-```mermaid
-flowchart LR
-  APP["XR18 app / X AIR Edit"] <-- Wi-Fi --> XR18[("Behringer XR18")]
-  XR18 <-- "Wi-Fi, OSC (UDP 10024)" --> MAIN["Main console<br/>ESP32-S3<br/>TFT + OLED + encoder<br/>+ 1 motor fader"]
-  MAIN <-- "UART 921600 baud" --> FB["Fader board<br/>ESP32-S3"]
-  FB --> DRV["4 × TC1508A<br/>motor drivers"]
-  DRV --> F["8 motorized faders"]
-  F -- touch --> MPR["MPR121<br/>touch sensor"]
-  MPR -- I2C --> FB
-  F -- wipers --> FB
-```
+*Complete wiring. Wire colours: red power, black ground, orange motor, green
+fader wiper, yellow touch, blue I²C, purple SPI, teal board link, grey
+other signals.*
 
 ---
 
@@ -58,8 +38,9 @@ flowchart LR
 | 9 | **10 kΩ linear motorized faders** with touch track | 8 bank faders + 1 on the main console. |
 | 5 | **TC1508A dual motor driver** modules | 4 on the fader board (2 faders each) and 1 on the main console. |
 | 1 | **MPR121** capacitive touch module | Touch for the 8 bank faders. |
+| 9 | **SSD1306 128 × 64 I2C OLED, 0.96"** | One per bank fader, one on the main console. |
+| 1 | **TCA9548A** I2C multiplexer | The 8 fader OLEDs share address 0x3C, so each gets its own channel. |
 | 1 | **4.0" ST7796 SPI TFT with XPT2046 touch** | 480 × 320. |
-| 1 | **SSD1306 128 × 64 I2C OLED, 0.96"** | Compact readout on the main console. |
 | 1 | **KY-040 rotary encoder** module | With push switch. |
 | 2 | **10 kΩ resistors** | Pull-downs on the fader board's G45 and G39 (see below). |
 | 1 | **5 V supply for the motors** | At least 3 A recommended for 9 motors. |
@@ -209,6 +190,20 @@ If the module has **SDA** and **CL** solder jumpers on the back, bridge them to
 enable its I2C pull-ups. Leave **ADD** open when ADDR is wired to GND, and
 leave **IRQ** open.
 
+### Fader displays (TCA9548A + 8 OLEDs)
+
+| TCA9548A | ESP32-S3 |
+|---|---|
+| VIN / GND | **3V3** / GND |
+| SDA / SCL | **G47** / **G48** (same bus as the MPR121) |
+| A0, A1, A2 | GND (address 0x70) |
+| RST | 3V3 |
+
+Fader *n*'s OLED goes to channel *n*−1: SDA → **SD(n−1)**, SCL →
+**SC(n−1)**, VCC → 3V3, GND → GND. Fader 1 is on SD0/SC0, fader 8 on SD7/SC7.
+Most OLED modules have their own pull-ups, which covers each channel. Without
+a multiplexer, a single OLED wired straight to G47/G48 shows fader 1.
+
 ### Link to the main console
 
 | Fader board | Main console |
@@ -238,8 +233,7 @@ boards run the same firmware:
 - board 1 links to the main console's **G13/G14** and drives bank faders 1–4;
 - board 2 links to **G1/G2** and drives bank faders 5–8.
 
-The main console maps them automatically. Touch this way is less robust than
-the MPR121, so it's only meant as a stop-gap.
+The main console maps them automatically. Touch is less reliable this way.
 
 ---
 
@@ -251,7 +245,7 @@ the MPR121, so it's only meant as a stop-gap.
    GND ───────────────────────┴──▶ TC1508A −, both ESP32 GNDs, MPR121 GND
                                     (ALL grounds shared)
 
-   USB (or 5 V pin) ──▶ each ESP32-S3 ──3V3──▶ fader tracks, MPR121, OLED, encoder
+   USB (or 5 V pin) ──▶ each ESP32-S3 ──3V3──▶ fader tracks, MPR121, TCA9548A, OLEDs, encoder
    5 V ──▶ TFT VCC
 ```
 
@@ -274,7 +268,7 @@ the MPR121, so it's only meant as a stop-gap.
 | Library | Used by | Tested version |
 |---|---|---|
 | LovyanGFX | main console (TFT + touch) | 1.2.28 |
-| U8g2 | main console (OLED) | 2.34.22 |
+| U8g2 | OLEDs (both boards) | 2.34.22 |
 | Adafruit MPR121 (+ Adafruit BusIO) | fader board | 1.2.1 (+ 1.17.4) |
 
 ### Board settings
@@ -395,16 +389,15 @@ fader number in a circle, which turns white while that fader is touched.
 
 ## How the faders move
 
-- **Smooth drive:** each motor runs drive/brake ("slow decay") PWM in both
-  directions, so its speed follows the power evenly from about 25–30% up.
-  The old drive/coast mode needed 70% power to move at all in one direction.
+- **Drive:** each motor runs drive/brake ("slow decay") PWM in both
+  directions, so speed follows power evenly from about 25–30% up.
 - **Glide:** each move follows a setpoint that speeds up, cruises and eases
   into the target. The motor tracks it with feed-forward (friction plus
   speed) plus position and speed correction, and a gradual push if it sticks.
   It brakes briefly at the end so it doesn't slide on.
 - **Streams:** a run of targets (dragging in the app, turning the encoder, a
-  linked partner) plays back as straight lines between the received values,
-  so the fader moves continuously instead of stopping at each step.
+  linked partner) plays back 80 ms behind real time as straight lines between
+  the received values, so uneven link timing doesn't make the fader stutter.
 - **Safety:**
   - a hand on a fader stops its motor at once;
   - a fader held far from its glide lets go;
@@ -421,6 +414,7 @@ UART, 921600 baud, 8N1, text lines.
 | main → board | `T <n> <pos>` | move fader *n* (0–7) to *pos* 0–1000; *pos* < 0 = no target |
 | main → board | `C` | recalibrate all faders |
 | main → board | `?` | ask for the hello line |
+| main → board | `N <n> <on> <solo> <label>\|<name>` | what fader *n* is assigned to, for its display (sent on change and every few seconds) |
 | board → main | `H <faders> <touch>` | hello: fader count, touch sensor present (at boot and on `?`) |
 | board → main | `S <mask> <p0> … <p7>` | every 20 ms: touched faders (bit mask) and positions 0–1000 (−1 = unknown) |
 
@@ -493,7 +487,7 @@ baselines. It also logs each pad touch and release.
 | Folder | What |
 |---|---|
 | `xr_console/` | **The main console**: Wi-Fi/OSC, TFT UI (`ui.h`), OLED, encoder, its motor fader, banks and the fader board link |
-| `xr_fader_board/` | **The fader board**: 8 motorized faders, MPR121 touch, calibration and the power-up show |
+| `xr_fader_board/` | **The fader board**: 8 motorized faders, MPR121 touch, the fader displays, calibration and the power-up show |
 | `xr_master_mute/` | First experiment: one button that mutes the main mix |
 | `xr_fader_knob/` | Encoder + OLED: set any channel's level with a knob |
 | `xr_slide_fader/` | Non-motorized slide fader with pickup |

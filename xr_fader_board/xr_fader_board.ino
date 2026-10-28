@@ -19,9 +19,11 @@
 //   Link to main board         TX G45 -> main G14, RX G46 <- main G13, GND
 //   Pull-downs (10k to GND)    G45 (else the flash may boot at 1.8 V) and
 //                              G39 (else fader 5 runs up during boot)
-//   Fader display (SSD1306 0.96" OLED, I2C 0x3C) on the same bus: SDA G47,
-//                              SCL G48, VCC 3V3, GND (one for now; a TCA9548A
-//                              multiplexer will give each fader its own)
+//   TCA9548A multiplexer       SDA -> G47, SCL -> G48 (the MPR121's bus), VIN 3V3,
+//                              GND, A0-A2 -> GND (0x70), RST -> 3V3
+//   Fader n display            0.96" SSD1306 OLED (0x3C): SDA -> TCA SD(n-1),
+//                              SCL -> TCA SC(n-1), VCC 3V3, GND
+//                              (no TCA9548A: one OLED straight on G47/G48 = fader 1)
 //   Unplug the G46 wire to flash this board: held high it blocks download mode.
 //   (G43/G44 aren't on the LCKFB board's headers.)
 //
@@ -88,6 +90,8 @@ const float    MOTOR_HELD_LAG = 0.2f;     // this far behind the glide...
 const uint32_t MOTOR_HELD_MS = 250;       // ...for this long = held or blocked: let go
 const uint32_t MOTOR_TIMEOUT_MS = 800;    // glide finished but still not there: give up
 const uint32_t FOLLOW_MS = 300;           // targets closer together than this = a stream
+const uint32_t STREAM_DELAY_MS = 80;      // streams play back this far behind (a jitter buffer)
+const float    STREAM_PULL = 25.0f;       // how firmly the glide holds to the stream's line, 1/s
 
 const uint32_t CAL_DRIVE_MS = 500;
 const float    CAL_END_GAP = 0.015f;    // -inf/+10 dB sit this far in from the end stops
@@ -111,8 +115,13 @@ struct Fader {
   float smooth = -1;                 // position 0-1, filtered
   float target = -1;                 // -1 = no target
   float sp = -1, spVel = 0;          // setpoint gliding towards the target, and its speed
-  float streamVel = 0;               // speed of a stream of targets, travel/s
-  uint32_t streamGap = 0;            // ...and the time between them (0 = no stream)
+  bool streaming = false;            // following a stream of targets (see glide())
+  static const int HIST = 8;         // ...its recent targets and when they arrived
+  float histV[HIST];
+  uint32_t histT[HIST];
+  uint8_t histN = 0;                 // how many are stored (newest last)
+  uint16_t dbgCount = 0, dbgBunched = 0;  // DEBUG: stream timing, logged when it ends
+  uint32_t dbgMin = 0, dbgMax = 0, dbgSum = 0;
   bool moving = false;
   volatile bool touched = false;     // set by loop(), acted on by the motor task
   float progressPos = 0;             // where it was when it last made progress
@@ -226,32 +235,81 @@ void setTarget(int n, float target, uint32_t now) {
   f.corrections = 0;
   f.arrivedAt = 0;
   if (!f.moving) startGlide(f, now);
-  // In a stream, play the steps back as straight lines, at a steady speed,
-  // never past the newest value. Aiming to reach it 1.5 steps from now
-  // rather than one means it's still on its way when the next value
-  // arrives: reaching it early stopped the glide dead at every late step.
+  // Keep the stream's recent targets for glide() to play back. Two arriving
+  // together (the link delivers them in bursts) count as one, updated.
   if (stream) {
-    f.streamGap = constrain(gap, (uint32_t)10, (uint32_t)100);
-    f.streamVel = constrain((target - f.sp) * 1000.0f / (f.streamGap * 1.5f), -MOVE_VMAX, MOVE_VMAX);
+    if (!f.streaming) {  // the stream's first target is already stored (below)
+      f.streaming = true;
+      f.dbgCount = 0;
+    }
+    if (f.histN && gap < 5) {
+      f.histV[f.histN - 1] = target;
+    } else {
+      if (f.histN == Fader::HIST) {
+        memmove(f.histV, f.histV + 1, sizeof(float) * (Fader::HIST - 1));
+        memmove(f.histT, f.histT + 1, sizeof(uint32_t) * (Fader::HIST - 1));
+        f.histN--;
+      }
+      f.histV[f.histN] = target;
+      f.histT[f.histN] = now;
+      f.histN++;
+    }
+    if (!f.dbgCount) { f.dbgMin = gap; f.dbgMax = gap; f.dbgSum = 0; f.dbgBunched = 0; }
+    f.dbgCount++;
+    f.dbgMin = min(f.dbgMin, gap);
+    f.dbgMax = max(f.dbgMax, gap);
+    f.dbgSum += gap;
+    if (gap < 5) f.dbgBunched++;
   } else {
-    f.streamGap = 0;
-    f.streamVel = 0;
+    f.streaming = false;
+    f.histN = 0;
+  }
+  if (!f.streaming) {  // this may be a stream's first target: remember it
+    f.histV[0] = target;
+    f.histT[0] = now;
+    f.histN = 1;
   }
 }
 
 // Advance the setpoint by dt seconds towards the target.
 void glide(Fader &f, float dt, uint32_t now) {
-  // No new value for a while: the stream has ended.
-  if (f.streamGap && now - f.lastTargetAt > f.streamGap * 3 / 2 + 20) { f.streamVel = 0; f.streamGap = 0; }
-  float e = f.target - f.sp;
-  // The fastest speed that still slows down smoothly onto the target; a
-  // stream also keeps to its own speed.
-  float want = copysignf(sqrtf(2.0f * MOVE_AMAX * fabsf(e)), e);
-  if (f.streamGap) want = f.streamVel * want >= 0.0f ? copysignf(min(fabsf(f.streamVel), fabsf(want)), want) : 0.0f;
+  // The stream has ended once its last target is fully played back.
+  if (f.streaming && now - f.lastTargetAt > STREAM_DELAY_MS + 40) {
+    f.streaming = false;
+    if (f.dbgCount >= 3)  // DEBUG
+      Serial.printf("fader %d stream: %u targets, gaps %lu/%lu/%lu ms (min/avg/max), %u bunched\n",
+                    (int)(&f - faders) + 1, f.dbgCount, f.dbgMin, f.dbgSum / f.dbgCount, f.dbgMax, f.dbgBunched);
+    f.dbgCount = 0;
+  }
+  float want;
+  if (f.streaming) {
+    // A stream plays back STREAM_DELAY_MS behind real time, along straight
+    // lines between the targets: a late or bunched target is then still in
+    // the past when it's needed, so uneven arrival can't make the fader surge
+    // (a jitter buffer). The setpoint follows that line at its speed, plus a
+    // pull back onto it.
+    uint32_t at = now - STREAM_DELAY_MS;
+    float r = f.histV[0], slope = 0.0f;
+    for (int i = f.histN - 1; i >= 0; i--) {
+      if ((int32_t)(at - f.histT[i]) < 0) continue;
+      r = f.histV[i];
+      if (i + 1 < f.histN) {
+        float span = (f.histT[i + 1] - f.histT[i]) / 1000.0f;
+        slope = (f.histV[i + 1] - f.histV[i]) / span;
+        r += slope * (at - f.histT[i]) / 1000.0f;
+      }
+      break;
+    }
+    want = slope + STREAM_PULL * (r - f.sp);
+  } else {
+    // The fastest speed that still slows down smoothly onto the target.
+    float e = f.target - f.sp;
+    want = copysignf(sqrtf(2.0f * MOVE_AMAX * fabsf(e)), e);
+  }
   want = constrain(want, -MOVE_VMAX, MOVE_VMAX);
   f.spVel += constrain(want - f.spVel, -MOVE_AMAX * dt, MOVE_AMAX * dt);
   float next = f.sp + f.spVel * dt;
-  if ((next - f.target) * (f.sp - f.target) <= 0.0f) { next = f.target; f.spVel = 0; }  // never past it
+  if (!f.streaming && (next - f.target) * (f.sp - f.target) <= 0.0f) { next = f.target; f.spVel = 0; }  // never past it
   f.sp = constrain(next, 0.0f, 1.0f);
 }
 
@@ -287,7 +345,7 @@ void updateFader(int n, uint32_t now, float dt) {
   glide(f, dt, now);
   float err = f.target - f.smooth;
   float lag = f.sp - f.smooth;
-  bool arrived = f.sp == f.target && !f.streamGap;
+  bool arrived = f.sp == f.target && !f.streaming;
   if (arrived && !f.arrivedAt) f.arrivedAt = now;
 
   if (arrived && fabsf(err) <= MOTOR_TOL && fabsf(f.vel) < MOTOR_STILL_VEL) {
@@ -537,17 +595,23 @@ void updateTouch(uint32_t now) {
 
 // ---------- displays ----------
 
-// A 0.96" SSD1306 OLED above a fader shows what it's assigned to: label,
-// name, level in dB, and mute and solo. The main board sends the label,
-// name, mute and solo ("N" lines); the level comes from the fader itself.
-// For now one display, straight on the MPR121's I2C bus (address 0x3C);
-// later a TCA9548A multiplexer gives each fader its own.
+// Each fader has a 0.96" SSD1306 OLED (128x64, I2C 0x3C) showing what it's
+// assigned to: label and level along the top, the name as large as it fits,
+// and MUTE / SOLO along the bottom. The main board sends the label, name,
+// mute and solo ("N" lines); the level comes from the fader itself.
 //
-// Drawing is fast, but sending a whole screen over I2C takes ~25 ms, which
-// would hold up touch reads on the same bus. So a changed screen is sent one
-// 8-pixel row at a time, one row per pass of loop() (~3 ms each).
-const int DISPLAY_FADER = 0;          // which fader the single display shows (0 = fader 1)
-const uint32_t DISPLAY_MIN_MS = 40;   // redraw at most this often
+// All eight answer at 0x3C, so each sits on its own channel of a TCA9548A
+// multiplexer (0x70) on the MPR121's bus: display n on channel n-1. One U8g2
+// object and one screen buffer serve them all; selecting a channel points it
+// at that display. The MPR121 sits upstream of the multiplexer, so touch
+// reads work whichever channel is selected. Without a multiplexer, a single
+// OLED wired straight to the bus shows fader 1 (the original test setup).
+//
+// Sending a whole screen takes ~25 ms at 400 kHz, which would hold up touch
+// reads on the same bus, so a changed screen goes out one 8-pixel row per
+// pass of loop() (~3 ms each). Displays that need redrawing take turns.
+const uint8_t TCA_ADDR = 0x70, OLED_ADDR = 0x3C;
+const uint32_t DISPLAY_MIN_MS = 40;   // redraw a display at most this often
 
 struct FaderInfo {
   char label[8] = "";                 // e.g. "CH 1", "BUS 3"; empty = unassigned
@@ -556,10 +620,14 @@ struct FaderInfo {
   bool solo = false;
 };
 FaderInfo info[MAX_FADERS];
-volatile uint32_t infoSeq = 0;        // bumped when any info changes
+uint32_t infoSeq[MAX_FADERS];         // bumped when a fader's info changes
 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C disp(U8G2_R0, U8X8_PIN_NONE);
-bool haveDisplay = false;
+bool haveTca = false;
+bool displayOn[MAX_FADERS];           // a display answered for this fader
+struct DisplayState { uint32_t drawnSeq = ~0u, lastDraw = 0; int drawnLevel = -2; };
+DisplayState dstate[MAX_FADERS];
+int tcaChannel = -2;                  // channel currently selected (-1 none, -2 unknown)
 
 // X-Air fader law: 0.0-1.0 maps to -inf..+10 dB in four linear segments.
 float faderToDb(float f) {
@@ -569,17 +637,47 @@ float faderToDb(float f) {
   return f * 480.0f - 90.0f;
 }
 
+// Point the I2C bus at fader n's display (-1: no channel).
+void selectDisplay(int n) {
+  if (!haveTca || n == tcaChannel) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(n < 0 ? 0 : 1 << n);
+  Wire.endTransmission();
+  tcaChannel = n;
+}
+
+bool oledAnswers() {
+  Wire.beginTransmission(OLED_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
 void displayBegin() {
-  Wire.beginTransmission(0x3C);
-  haveDisplay = Wire.endTransmission() == 0;
-  if (!haveDisplay) {
-    Serial.println("No fader display found");
-    return;
-  }
   disp.setBusClock(400000);
-  disp.begin();
-  disp.setContrast(255);
-  Serial.println("Fader display found");
+  Wire.beginTransmission(TCA_ADDR);
+  haveTca = Wire.endTransmission() == 0;
+  int found = 0;
+  if (haveTca) {
+    for (int n = 0; n < FADERS; n++) {
+      selectDisplay(n);
+      displayOn[n] = oledAnswers();
+      if (displayOn[n]) {
+        disp.begin();  // starts and clears the display on this channel
+        disp.setContrast(255);
+        found++;
+      }
+    }
+    selectDisplay(-1);
+    Serial.printf("Fader displays: TCA9548A found, %d of %d displays (", found, FADERS);
+    for (int n = 0; n < FADERS; n++) Serial.printf("%s%c", n ? " " : "", displayOn[n] ? '1' + n : '-');
+    Serial.println(")");
+  } else if (oledAnswers()) {
+    displayOn[0] = true;
+    disp.begin();
+    disp.setContrast(255);
+    Serial.println("Fader displays: no multiplexer, one display (fader 1)");
+  } else {
+    Serial.println("Fader displays: none found");
+  }
 }
 
 // Draw fader n's screen into the buffer:
@@ -629,25 +727,32 @@ void drawFaderScreen(int n, float level) {
 }
 
 void displayService(uint32_t now) {
-  if (!haveDisplay) return;
-  static uint32_t lastDraw = 0, drawnSeq = ~0u;
-  static int drawnLevel = -2;
-  static int sendRow = 8;  // next 8-pixel row to send (8 = all sent)
-  if (sendRow < 8) {
+  static int sending = -1, sendRow = 0;  // display being sent, its next row
+  static int next = 0;                   // where the next look for work starts
+  if (sending >= 0) {
+    selectDisplay(sending);
     disp.updateDisplayArea(0, sendRow, 16, 1);
-    sendRow++;
+    if (++sendRow >= 8) sending = -1;
     return;
   }
-  const Fader &f = faders[DISPLAY_FADER];
-  // Show where the fader is while a hand moves it, otherwise its level.
-  float level = f.touched || f.target < 0 ? f.smooth : f.target;
-  int shown = level < 0 ? -1 : (int)lroundf(level * 1023);  // the mixer's 1023 steps
-  if ((shown != drawnLevel || infoSeq != drawnSeq) && now - lastDraw >= DISPLAY_MIN_MS) {
-    lastDraw = now;
-    drawnLevel = shown;
-    drawnSeq = infoSeq;
-    drawFaderScreen(DISPLAY_FADER, level);
-    sendRow = 0;
+  for (int k = 0; k < FADERS; k++) {
+    int n = (next + k) % FADERS;
+    if (!displayOn[n]) continue;
+    const Fader &f = faders[n];
+    // Show where the fader is while a hand moves it, otherwise its level.
+    float level = f.touched || f.target < 0 ? f.smooth : f.target;
+    int shown = level < 0 ? -1 : (int)lroundf(level * 1023);  // the mixer's 1023 steps
+    DisplayState &d = dstate[n];
+    if ((shown != d.drawnLevel || infoSeq[n] != d.drawnSeq) && now - d.lastDraw >= DISPLAY_MIN_MS) {
+      d.lastDraw = now;
+      d.drawnLevel = shown;
+      d.drawnSeq = infoSeq[n];
+      drawFaderScreen(n, level);
+      sending = n;
+      sendRow = 0;
+      next = n + 1;  // then give the others a turn
+      return;
+    }
   }
 }
 
@@ -663,7 +768,7 @@ void handleInfo(char *line) {
   in.solo = solo != 0;
   strlcpy(in.label, label, sizeof(in.label));
   strlcpy(in.name, name, sizeof(in.name));
-  infoSeq = infoSeq + 1;
+  infoSeq[n]++;
 }
 
 // ---------- link ----------
@@ -891,7 +996,7 @@ void printRecording() {
   Serial.println("rec end");
 }
 
-struct TargetStream { int fader; int from, to; uint32_t ms, stepMs, startAt, lastAt; };
+struct TargetStream { int fader; int from, to; uint32_t ms, stepMs, startAt, lastAt; bool uneven; uint32_t gap; };
 TargetStream testStream = {-1, 0, 0, 0, 0, 0, 0};
 
 void motorTask(void *) {
@@ -978,12 +1083,14 @@ void loop() {
         snprintf(line, sizeof(line), "T %d %d", n - 1, pos);
         handleLine(line, true);
       }
-      // "S <n> <from> <to> <ms> <step ms>": a stream of targets, like the app or encoder
-      if (clen && cmd[0] == 'S' && sscanf(cmd + 1, "%d %d %d %d %d", &n, &a, &b, &ms, &step) == 5 &&
+      // "S <n> <from> <to> <ms> <step ms> [u]": a stream of targets, like the app or
+      // encoder; "u" spaces them unevenly (bunched or late), like the real link
+      int un = 0;
+      if (clen && cmd[0] == 'S' && sscanf(cmd + 1, "%d %d %d %d %d %d", &n, &a, &b, &ms, &step, &un) >= 5 &&
           n >= 1 && n <= FADERS && ms > 0 && step > 0) {
         usbControl = true;
         startRecording(n - 1);
-        testStream = {n - 1, a, b, (uint32_t)ms, (uint32_t)step, now, 0};
+        testStream = {n - 1, a, b, (uint32_t)ms, (uint32_t)step, now, 0, un != 0, (uint32_t)step};
       }
       if (clen && cmd[0] == 'R') printRecording();
       int cdc, cdt;  // DEBUG "Q <charge uA 1-63> <time code 1-7>": MPR121 charge settings, then readings
@@ -1007,8 +1114,10 @@ void loop() {
       cmd[clen++] = c;
     }
   }
-  if (testStream.fader >= 0 && now - testStream.lastAt >= testStream.stepMs) {  // DEBUG target stream
+  if (testStream.fader >= 0 && now - testStream.lastAt >= testStream.gap) {  // DEBUG target stream
     testStream.lastAt = now;
+    testStream.gap = !testStream.uneven ? testStream.stepMs
+                     : random(100) < 30 ? 2 : random(testStream.stepMs / 2, testStream.stepMs * 4);
     float k = min(1.0f, (float)(now - testStream.startAt) / testStream.ms);
     char line[24];
     snprintf(line, sizeof(line), "T %d %d", testStream.fader, (int)lroundf(testStream.from + k * (testStream.to - testStream.from)));
